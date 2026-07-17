@@ -1,0 +1,13 @@
+# JavaScript dependencies and generated web build
+web/node_modules/
+web/dist/
+
+# Local editor and operating-system files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Python bytecode and local virtual environments
+__pycache__/
+*.py[cod]
+.venv/

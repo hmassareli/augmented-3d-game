@@ -1,0 +1,47 @@
+:root {
+  font-family: Georgia, 'Times New Roman', serif;
+  color: #f7f1e8;
+  background: #15191c;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+
+#game-shell { height: 100svh; min-height: 540px; overflow: hidden; position: relative; }
+#ring { display: block; height: 100%; width: 100%; }
+
+.hud { position: absolute; z-index: 1; pointer-events: none; }
+.top-hud { left: 50%; text-align: center; top: 24px; transform: translateX(-50%); }
+.eyebrow { color: #d7bd85; font-family: ui-monospace, monospace; font-size: 11px; letter-spacing: 2px; margin: 0; white-space: nowrap; }
+.eyebrow span { color: #a83835; padding: 0 5px; }
+h1 { font-size: 25px; letter-spacing: 4px; line-height: 1; margin: 9px 0 0; }
+
+.fighter-status { bottom: 29px; font-family: ui-monospace, monospace; font-size: 11px; letter-spacing: 1px; width: min(260px, calc(50vw - 34px)); }
+.player-status { left: 28px; }
+.opponent-status { right: 28px; text-align: right; }
+.fighter-status div:first-child { align-items: baseline; display: flex; justify-content: space-between; margin-bottom: 7px; }
+.opponent-status div:first-child { flex-direction: row-reverse; }
+.fighter-status strong { color: #f2d08d; font-size: 18px; }
+.meter { background: rgba(255, 255, 255, 0.16); height: 5px; overflow: hidden; }
+.meter i { background: #cb4c44; display: block; height: 100%; transition: width 120ms linear; width: 100%; }
+.player-status .meter i { background: #3db4a7; }
+.opponent-status .meter i { margin-left: auto; }
+.controls { bottom: 29px; font-family: ui-monospace, monospace; font-size: 11px; left: 50%; letter-spacing: 0.4px; transform: translateX(-50%); white-space: nowrap; }
+.camera-panel { bottom: 72px; font-family: ui-monospace, monospace; left: 28px; position: absolute; width: 158px; z-index: 2; }
+.camera-panel video { background: #0a0c0d; border: 1px solid rgba(247, 241, 232, 0.3); display: block; height: 94px; object-fit: cover; transform: scaleX(-1); width: 100%; }
+.camera-panel__status { align-items: center; display: flex; font-size: 9px; gap: 5px; letter-spacing: 0.4px; margin: 6px 0; text-transform: uppercase; }
+.camera-panel__status i { background: #9c4540; border-radius: 50%; display: inline-block; height: 6px; width: 6px; }
+.camera-panel__status i.is-active { background: #45c7a5; box-shadow: 0 0 8px rgba(69, 199, 165, 0.8); }
+.camera-panel button { background: #f0d399; border: 0; color: #172021; cursor: pointer; font: inherit; font-size: 10px; letter-spacing: 0.5px; padding: 7px 9px; text-transform: uppercase; width: 100%; }
+.camera-panel button:disabled { cursor: wait; opacity: 0.65; }
+
+@media (max-width: 700px) {
+  .fighter-status { bottom: 64px; }
+  .player-status { left: 16px; }
+  .opponent-status { right: 16px; }
+  .controls { bottom: 18px; font-size: 10px; }
+  .camera-panel { bottom: 102px; left: 16px; transform: scale(0.85); transform-origin: bottom left; }
+  .top-hud { top: 18px; }
+  h1 { font-size: 20px; }
+}
