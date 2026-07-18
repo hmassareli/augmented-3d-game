@@ -22,6 +22,7 @@ app.innerHTML = `
     </section>
     <section class="camera-panel" aria-label="Controle de webcam">
       <video id="webcam" autoplay muted playsinline></video>
+      <canvas id="pose-overlay" aria-hidden="true"></canvas>
       <div class="camera-panel__status"><i id="tracking-dot"></i><span id="tracking-status">camera desligada</span></div>
       <button id="camera-button" type="button">Ativar camera</button>
     </section>
@@ -41,8 +42,8 @@ scene.background = new THREE.Color('#15191c')
 scene.fog = new THREE.Fog('#15191c', 10, 28)
 
 const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100)
-camera.position.set(8.2, 6.8, 10.5)
-camera.lookAt(0, 0.5, 0)
+camera.position.set(-1.15, 2.55, -1.2)
+camera.lookAt(0, 1.35, 2.2)
 
 scene.add(new THREE.HemisphereLight('#b8e8ef', '#27202b', 2.3))
 const keyLight = new THREE.SpotLight('#fff2dc', 180, 25, Math.PI / 5, 0.45)
@@ -107,7 +108,6 @@ const player = createFighter('#1f8c87', '#e7b96a')
 player.position.set(0, 0, 2.2)
 scene.add(player)
 let playerAvatar: THREE.Group | undefined
-let playerMixer: THREE.AnimationMixer | undefined
 
 type PosePoint = { x: number; y: number; z: number }
 type TrackedPose = {
@@ -130,24 +130,11 @@ type BoneRestPose = {
 
 const retargetBones = new Map<string, BoneRestPose>()
 let latestPose: TrackedPose | undefined
-const cameraGloves = new THREE.Group()
-const cameraGloveMaterial = new THREE.MeshStandardMaterial({ color: '#e2b05f', roughness: 0.3, metalness: 0.06 })
-const trackedLeftGlove = new THREE.Mesh(new THREE.SphereGeometry(0.27, 20, 16), cameraGloveMaterial)
-const trackedRightGlove = trackedLeftGlove.clone()
-for (const glove of [trackedLeftGlove, trackedRightGlove]) {
-  glove.scale.set(0.9, 1.15, 1.05)
-  glove.castShadow = true
-  cameraGloves.add(glove)
-}
-cameraGloves.visible = false
-scene.add(cameraGloves)
-const opponent = createFighter('#9a3d3c', '#f1e2c8')
-opponent.position.set(0, 0, -2.2)
-opponent.rotation.y = Math.PI
-scene.add(opponent)
 
 const keys = new Set<string>()
 const webcam = document.querySelector<HTMLVideoElement>('#webcam')!
+const poseOverlay = document.querySelector<HTMLCanvasElement>('#pose-overlay')!
+const poseContext = poseOverlay.getContext('2d')!
 const cameraButton = document.querySelector<HTMLButtonElement>('#camera-button')!
 const trackingStatus = document.querySelector<HTMLSpanElement>('#tracking-status')!
 const trackingDot = document.querySelector<HTMLElement>('#tracking-dot')!
@@ -158,13 +145,11 @@ const fbxLoader = new FBXLoader()
 let poseLandmarker: PoseLandmarker | undefined
 let lastVideoTime = -1
 let trackingActive = false
-const trackedGloveTargets = {
-  left: new THREE.Vector3(-0.54, 1.55, 0.08),
-  right: new THREE.Vector3(0.54, 1.55, 0.08),
-}
 
 function firstChildBone(bone: THREE.Bone): THREE.Bone | undefined {
-  return bone.children.find((child): child is THREE.Bone => child instanceof THREE.Bone)
+  return bone.children.find(
+    (child): child is THREE.Bone => child instanceof THREE.Bone && child.name !== bone.name,
+  )
 }
 
 function cacheRetargetBones(avatar: THREE.Group): void {
@@ -211,7 +196,7 @@ function poseToAvatarSpace(point: PosePoint, shoulderCenter: PosePoint, shoulder
   return new THREE.Vector3(
     (shoulderCenter.x - point.x) / shoulderWidth,
     (shoulderCenter.y - point.y) / shoulderWidth,
-    (point.z - shoulderCenter.z) / shoulderWidth,
+    (shoulderCenter.z - point.z) / shoulderWidth,
   )
 }
 
@@ -249,12 +234,23 @@ function applyUpperBodyPose(): void {
   rotateBoneToward('mixamorigRightForeArm', rightWristPoint.sub(rightElbowPoint), 0.9)
 }
 
+function applyGuardPose(): void {
+  if (!playerAvatar || retargetBones.size === 0) return
+
+  for (const restPose of retargetBones.values()) {
+    restPose.bone.quaternion.copy(restPose.restLocalQuaternion)
+  }
+  playerAvatar.updateWorldMatrix(true, true)
+
+  rotateBoneToward('mixamorigLeftArm', new THREE.Vector3(-0.5, 0.05, 0.7), 1)
+  rotateBoneToward('mixamorigLeftForeArm', new THREE.Vector3(0, 0.6, 0.55), 1)
+  rotateBoneToward('mixamorigRightArm', new THREE.Vector3(0.5, 0.05, 0.7), 1)
+  rotateBoneToward('mixamorigRightForeArm', new THREE.Vector3(0, 0.6, 0.55), 1)
+}
+
 async function loadPlayerAvatar(): Promise<void> {
   try {
-    const [avatar, hook] = await Promise.all([
-      fbxLoader.loadAsync('/assets/mixamo/character/y-bot.fbx'),
-      fbxLoader.loadAsync('/assets/mixamo/animations/hook.fbx'),
-    ])
+    const avatar = await fbxLoader.loadAsync('/assets/mixamo/character/y-bot.fbx')
     avatar.scale.setScalar(0.01)
     avatar.traverse((object) => {
       if (object instanceof THREE.Mesh) {
@@ -269,13 +265,8 @@ async function loadPlayerAvatar(): Promise<void> {
     playerAvatar = avatar
     avatar.updateWorldMatrix(true, true)
     cacheRetargetBones(avatar)
-
-    if (hook.animations[0]) {
-      playerMixer = new THREE.AnimationMixer(avatar)
-      playerMixer.clipAction(hook.animations[0]).play()
-    }
   } catch (error) {
-    console.error('Unable to load Y Bot or Hook animation', error)
+    console.error('Unable to load Y Bot', error)
   }
 }
 
@@ -293,6 +284,57 @@ window.addEventListener('keyup', (event) => keys.delete(event.key.toLowerCase())
 function setTrackingStatus(message: string, active = false): void {
   trackingStatus.textContent = message
   trackingDot.classList.toggle('is-active', active)
+}
+
+const poseConnections: ReadonlyArray<readonly [number, number]> = [
+  [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24],
+  [23, 25], [25, 27], [24, 26], [26, 28],
+]
+
+function drawPoseOverlay(landmarks: readonly PosePoint[] | undefined): void {
+  const width = webcam.clientWidth
+  const height = webcam.clientHeight
+  if (poseOverlay.width !== width || poseOverlay.height !== height) {
+    poseOverlay.width = width
+    poseOverlay.height = height
+  }
+  poseContext.clearRect(0, 0, width, height)
+  if (!landmarks?.length || !webcam.videoWidth || !webcam.videoHeight) return
+
+  const videoScale = Math.max(width / webcam.videoWidth, height / webcam.videoHeight)
+  const renderedWidth = webcam.videoWidth * videoScale
+  const renderedHeight = webcam.videoHeight * videoScale
+  const offsetX = (width - renderedWidth) / 2
+  const offsetY = (height - renderedHeight) / 2
+  const pointFor = (landmark: PosePoint): [number, number] => [
+    offsetX + landmark.x * renderedWidth,
+    offsetY + landmark.y * renderedHeight,
+  ]
+
+  poseContext.lineCap = 'round'
+  poseContext.lineWidth = 2
+  poseContext.strokeStyle = '#42d8ae'
+  for (const [firstIndex, secondIndex] of poseConnections) {
+    const first = landmarks[firstIndex]
+    const second = landmarks[secondIndex]
+    if (!first || !second) continue
+    const [firstX, firstY] = pointFor(first)
+    const [secondX, secondY] = pointFor(second)
+    poseContext.beginPath()
+    poseContext.moveTo(firstX, firstY)
+    poseContext.lineTo(secondX, secondY)
+    poseContext.stroke()
+  }
+
+  for (const index of new Set(poseConnections.flat())) {
+    const landmark = landmarks[index]
+    if (!landmark) continue
+    const [x, y] = pointFor(landmark)
+    poseContext.fillStyle = (landmark as typeof landmark & { visibility?: number }).visibility ?? 0 >= 0.45 ? '#42d8ae' : '#df9a4e'
+    poseContext.beginPath()
+    poseContext.arc(x, y, 3, 0, Math.PI * 2)
+    poseContext.fill()
+  }
 }
 
 async function startCamera(): Promise<void> {
@@ -318,8 +360,6 @@ async function startCamera(): Promise<void> {
     })
     await webcam.play()
     trackingActive = true
-    cameraGloves.visible = true
-    playerMixer?.stopAllAction()
     cameraButton.textContent = 'Camera ativa'
     setTrackingStatus('procurando postura...')
   } catch (error) {
@@ -338,6 +378,7 @@ function updateTrackedGloves(): void {
   lastVideoTime = webcam.currentTime
   const result = poseLandmarker.detectForVideo(webcam, performance.now())
   const landmarks = result.landmarks[0]
+  drawPoseOverlay(landmarks)
   if (!landmarks) {
     setTrackingStatus('corpo fora do quadro')
     return
@@ -352,26 +393,24 @@ function updateTrackedGloves(): void {
   const leftHip = landmarks[23]
   const rightHip = landmarks[24]
   const shoulderWidth = Math.abs(leftShoulder.x - rightShoulder.x)
-  const visibility = Math.min(leftWrist.visibility ?? 0, rightWrist.visibility ?? 0)
+  const torsoVisibility = Math.min(
+    leftShoulder.visibility ?? 0,
+    rightShoulder.visibility ?? 0,
+    leftHip.visibility ?? 0,
+    rightHip.visibility ?? 0,
+  )
+  const wristVisibility = Math.min(leftWrist.visibility ?? 0, rightWrist.visibility ?? 0)
 
-  if (shoulderWidth < 0.08 || visibility < 0.45) {
-    setTrackingStatus('mostre ombros e maos')
+  if (shoulderWidth < 0.08 || torsoVisibility < 0.45) {
+    setTrackingStatus('mostre tronco e ombros')
+    return
+  }
+  if (wristVisibility < 0.45) {
+    latestPose = undefined
+    setTrackingStatus('mostre as maos para os bracos')
     return
   }
 
-  const mapWrist = (wrist: typeof leftWrist, shoulder: typeof leftShoulder, side: number): THREE.Vector3 => {
-    const horizontal = (wrist.x - shoulder.x) / shoulderWidth
-    const vertical = (shoulder.y - wrist.y) / shoulderWidth
-    const depth = THREE.MathUtils.clamp((wrist.z - shoulder.z) / shoulderWidth, -0.45, 0.85)
-    return new THREE.Vector3(
-      THREE.MathUtils.clamp(side * 0.54 - horizontal * 1.25, -1.35, 1.35),
-      THREE.MathUtils.clamp(1.55 + vertical * 1.1, 0.68, 2.6),
-      THREE.MathUtils.clamp(0.08 + depth * 0.8, -0.5, 1.15),
-    )
-  }
-
-  trackedGloveTargets.left.copy(mapWrist(leftWrist, leftShoulder, -1))
-  trackedGloveTargets.right.copy(mapWrist(rightWrist, rightShoulder, 1))
   latestPose = { leftShoulder, rightShoulder, leftElbow, rightElbow, leftWrist, rightWrist, leftHip, rightHip, shoulderWidth }
   setTrackingStatus('rastreamento ativo', true)
 }
@@ -407,29 +446,24 @@ function animate(time: number): void {
     playerStamina = Math.min(100, playerStamina + 12 * delta)
   }
 
-  const playerToOpponent = opponent.position.clone().sub(player.position)
-  player.rotation.y = Math.atan2(playerToOpponent.x, playerToOpponent.z)
-  opponent.rotation.y = Math.atan2(-playerToOpponent.x, -playerToOpponent.z)
-  opponent.position.x = Math.sin(time / 1250) * 1.3
-  opponentStamina = 72 + Math.sin(time / 1900) * 12
-
   if (playerAvatar) {
     playerAvatar.position.copy(player.position)
     playerAvatar.rotation.copy(player.rotation)
   }
 
+  const cameraOffset = new THREE.Vector3(-1.15, 2.05, -3.4).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.rotation.y)
+  const cameraTarget = player.position.clone().add(new THREE.Vector3(0, 1.25, 0.35))
+  camera.position.lerp(player.position.clone().add(cameraOffset), 1 - Math.exp(-7 * delta))
+  camera.lookAt(cameraTarget)
+
   updateTrackedGloves()
-  if (trackingActive) {
-    cameraGloves.position.copy(player.position)
-    cameraGloves.rotation.copy(player.rotation)
-    trackedLeftGlove.position.lerp(trackedGloveTargets.left, 0.22)
-    trackedRightGlove.position.lerp(trackedGloveTargets.right, 0.22)
+  if (trackingActive && latestPose) {
     applyUpperBodyPose()
   } else {
+    applyGuardPose()
     punch(player, 'left-glove', keys.has('j') && playerStamina >= 5 ? 0.9 : 0.08)
     punch(player, 'right-glove', keys.has('k') && playerStamina >= 7 ? 1.05 : 0.08)
   }
-  playerMixer?.update(delta)
   updateHud()
   renderer.render(scene, camera)
   requestAnimationFrame(animate)

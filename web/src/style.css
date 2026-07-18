@@ -30,6 +30,7 @@ h1 { font-size: 25px; letter-spacing: 4px; line-height: 1; margin: 9px 0 0; }
 .controls { bottom: 29px; font-family: ui-monospace, monospace; font-size: 11px; left: 50%; letter-spacing: 0.4px; transform: translateX(-50%); white-space: nowrap; }
 .camera-panel { bottom: 72px; font-family: ui-monospace, monospace; left: 28px; position: absolute; width: 158px; z-index: 2; }
 .camera-panel video { background: #0a0c0d; border: 1px solid rgba(247, 241, 232, 0.3); display: block; height: 94px; object-fit: cover; transform: scaleX(-1); width: 100%; }
+.camera-panel #pose-overlay { height: 94px; left: 0; pointer-events: none; position: absolute; top: 0; transform: scaleX(-1); width: 100%; }
 .camera-panel__status { align-items: center; display: flex; font-size: 9px; gap: 5px; letter-spacing: 0.4px; margin: 6px 0; text-transform: uppercase; }
 .camera-panel__status i { background: #9c4540; border-radius: 50%; display: inline-block; height: 6px; width: 6px; }
 .camera-panel__status i.is-active { background: #45c7a5; box-shadow: 0 0 8px rgba(69, 199, 165, 0.8); }
