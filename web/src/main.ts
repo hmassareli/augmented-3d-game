@@ -1,5 +1,5 @@
 import './style.css'
-import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision'
+import { FilesetResolver, HandLandmarker, PoseLandmarker } from '@mediapipe/tasks-vision'
 import * as THREE from 'three'
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js'
 
@@ -26,6 +26,10 @@ app.innerHTML = `
       <div class="camera-panel__status"><i id="tracking-dot"></i><span id="tracking-status">camera desligada</span></div>
       <button id="camera-button" type="button">Ativar camera</button>
     </section>
+    <section class="comparison-legend" aria-label="Comparação dos rastreadores">
+      <span><i class="comparison-legend__pose"></i>ESQUERDA: CORPO</span>
+      <span><i class="comparison-legend__fused"></i>DIREITA: MAOS -&gt; IK</span>
+    </section>
     <footer class="hud controls">WASD move &nbsp; · &nbsp; J jab &nbsp; · &nbsp; K cross &nbsp; · &nbsp; R reset</footer>
   </main>
 `
@@ -42,8 +46,11 @@ scene.background = new THREE.Color('#15191c')
 scene.fog = new THREE.Fog('#15191c', 10, 28)
 
 const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100)
-camera.position.set(-1.15, 2.55, -1.2)
-camera.lookAt(0, 1.35, 2.2)
+camera.position.set(1.15, 2.55, 6.4)
+camera.lookAt(0, 1.35, 0)
+let cameraOrbitYaw = 0
+let cameraOrbitPitch = 0
+let cameraDragPointer: { id: number; x: number; y: number } | undefined
 
 scene.add(new THREE.HemisphereLight('#b8e8ef', '#27202b', 2.3))
 const keyLight = new THREE.SpotLight('#fff2dc', 180, 25, Math.PI / 5, 0.45)
@@ -69,18 +76,6 @@ apron.position.y = -0.38
 apron.receiveShadow = true
 ring.add(apron)
 
-const ropeMaterial = new THREE.MeshStandardMaterial({ color: '#b63236', roughness: 0.42 })
-for (const height of [0.8, 1.35, 1.9]) {
-  for (const [width, rotation] of [[8.8, 0], [8.8, Math.PI / 2]] as const) {
-    for (const side of [-1, 1]) {
-      const rope = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, width, 10), ropeMaterial)
-      rope.rotation.z = rotation
-      rope.position.set(rotation ? side * 4.4 : 0, height, rotation ? 0 : side * 4.4)
-      ring.add(rope)
-    }
-  }
-}
-
 function createFighter(bodyColor: string, gloveColor: string): THREE.Group {
   const fighter = new THREE.Group()
   const material = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.63 })
@@ -104,12 +99,16 @@ function createFighter(bodyColor: string, gloveColor: string): THREE.Group {
   return fighter
 }
 
+const PLAYER_START_POSITION = new THREE.Vector3(0, 0, 3.2)
+const PLAYER_START_ROTATION_Y = Math.PI
+
 const player = createFighter('#1f8c87', '#e7b96a')
-player.position.set(0, 0, 2.2)
+player.position.copy(PLAYER_START_POSITION)
+player.rotation.y = PLAYER_START_ROTATION_Y
 scene.add(player)
-let playerAvatar: THREE.Group | undefined
 
 type PosePoint = { x: number; y: number; z: number }
+type ImagePoint = PosePoint & { visibility?: number }
 type TrackedPose = {
   leftShoulder: PosePoint
   rightShoulder: PosePoint
@@ -123,13 +122,30 @@ type TrackedPose = {
 }
 type BoneRestPose = {
   bone: THREE.Bone
+  childBone: THREE.Bone
   restLocalQuaternion: THREE.Quaternion
   restQuaternionInRoot: THREE.Quaternion
   restDirectionInRoot: THREE.Vector3
+  restPalmNormalInRoot: THREE.Vector3
 }
+type AvatarRig = {
+  avatar: THREE.Group
+  bones: Map<string, BoneRestPose>
+}
+type TrackedHands = {
+  left?: readonly ImagePoint[]
+  right?: readonly ImagePoint[]
+}
+type HandDepths = {
+  left?: number
+  right?: number
+}
+type HandSide = 'left' | 'right'
 
-const retargetBones = new Map<string, BoneRestPose>()
-let latestPose: TrackedPose | undefined
+let poseAvatar: AvatarRig | undefined
+let playerAvatar: AvatarRig | undefined
+let latestPoseOnly: TrackedPose | undefined
+let latestPoseWithHandDepth: TrackedPose | undefined
 
 const keys = new Set<string>()
 const webcam = document.querySelector<HTMLVideoElement>('#webcam')!
@@ -143,8 +159,41 @@ let opponentStamina = 100
 let lastTime = performance.now()
 const fbxLoader = new FBXLoader()
 let poseLandmarker: PoseLandmarker | undefined
+let handLandmarker: HandLandmarker | undefined
 let lastVideoTime = -1
 let trackingActive = false
+let latestHandLandmarks: readonly (readonly ImagePoint[])[] = []
+let latestHandLabels: Array<'Left' | 'Right' | undefined> = []
+let latestTrackedHands: TrackedHands = {}
+let latestHandDepths: HandDepths = {}
+const handDepthCalibration: Record<HandSide, { wrist: ImagePoint; palmSpan: number; palmDepth: number; poseDepth: number } | undefined> = {
+  left: undefined,
+  right: undefined,
+}
+
+canvas.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0) return
+  cameraDragPointer = { id: event.pointerId, x: event.clientX, y: event.clientY }
+  canvas.setPointerCapture(event.pointerId)
+  canvas.classList.add('is-dragging')
+})
+
+canvas.addEventListener('pointermove', (event) => {
+  if (!cameraDragPointer || event.pointerId !== cameraDragPointer.id) return
+  cameraOrbitYaw -= (event.clientX - cameraDragPointer.x) * 0.008
+  cameraOrbitPitch = THREE.MathUtils.clamp(cameraOrbitPitch - (event.clientY - cameraDragPointer.y) * 0.006, -0.55, 0.55)
+  cameraDragPointer.x = event.clientX
+  cameraDragPointer.y = event.clientY
+})
+
+function stopCameraDrag(event: PointerEvent): void {
+  if (!cameraDragPointer || event.pointerId !== cameraDragPointer.id) return
+  cameraDragPointer = undefined
+  canvas.classList.remove('is-dragging')
+}
+
+canvas.addEventListener('pointerup', stopCameraDrag)
+canvas.addEventListener('pointercancel', stopCameraDrag)
 
 function firstChildBone(bone: THREE.Bone): THREE.Bone | undefined {
   return bone.children.find(
@@ -152,34 +201,71 @@ function firstChildBone(bone: THREE.Bone): THREE.Bone | undefined {
   )
 }
 
-function cacheRetargetBones(avatar: THREE.Group): void {
-  const boneNames = ['mixamorigSpine', 'mixamorigLeftArm', 'mixamorigLeftForeArm', 'mixamorigRightArm', 'mixamorigRightForeArm']
+function preferredChildBone(bone: THREE.Bone, boneName: string): THREE.Bone | undefined {
+  // Mixamo Hand lists Thumb first; using it as rest axis makes palms look sideways.
+  if (boneName.endsWith('Hand')) {
+    const side = boneName.includes('Left') ? 'Left' : 'Right'
+    const middle = bone.getObjectByName(`mixamorig${side}HandMiddle1`)
+    if (middle instanceof THREE.Bone) return middle
+  }
+  return firstChildBone(bone)
+}
+
+function cacheRetargetBones(avatar: THREE.Group): Map<string, BoneRestPose> {
+  const retargetBones = new Map<string, BoneRestPose>()
+  const handBoneNames = ['Left', 'Right'].flatMap((side) => [
+    `mixamorig${side}Hand`,
+    ...['Thumb', 'Index', 'Middle', 'Ring', 'Pinky'].flatMap((finger) =>
+      [1, 2, 3].map((segment) => `mixamorig${side}Hand${finger}${segment}`),
+    ),
+  ])
+  const boneNames = [
+    'mixamorigSpine', 'mixamorigLeftArm', 'mixamorigLeftForeArm', 'mixamorigRightArm', 'mixamorigRightForeArm', ...handBoneNames,
+  ]
   const rootWorldQuaternion = avatar.getWorldQuaternion(new THREE.Quaternion())
   const inverseRootQuaternion = rootWorldQuaternion.clone().invert()
 
   for (const name of boneNames) {
     const bone = avatar.getObjectByName(name)
     if (!(bone instanceof THREE.Bone)) continue
-    const childBone = firstChildBone(bone)
+    const childBone = preferredChildBone(bone, name)
     if (!childBone) continue
 
     const bonePosition = bone.getWorldPosition(new THREE.Vector3())
     const childPosition = childBone.getWorldPosition(new THREE.Vector3())
     const restDirection = childPosition.sub(bonePosition).normalize()
+    let restPalmNormalInRoot = new THREE.Vector3(0, -1, 0)
+    if (name.endsWith('Hand')) {
+      const side = name.includes('Left') ? 'Left' : 'Right'
+      const index = avatar.getObjectByName(`mixamorig${side}HandIndex1`)
+      const pinky = avatar.getObjectByName(`mixamorig${side}HandPinky1`)
+      if (index instanceof THREE.Bone && pinky instanceof THREE.Bone) {
+        const indexPosition = index.getWorldPosition(new THREE.Vector3())
+        const pinkyPosition = pinky.getWorldPosition(new THREE.Vector3())
+        const acrossPalm = indexPosition.sub(pinkyPosition).normalize()
+        const restPalmNormalWorld = new THREE.Vector3().crossVectors(restDirection, acrossPalm).normalize()
+        if (restPalmNormalWorld.lengthSq() > 0.0001) {
+          restPalmNormalInRoot = restPalmNormalWorld.applyQuaternion(inverseRootQuaternion)
+        }
+      }
+    }
     retargetBones.set(name, {
       bone,
+      childBone,
       restLocalQuaternion: bone.quaternion.clone(),
       restQuaternionInRoot: inverseRootQuaternion.clone().multiply(bone.getWorldQuaternion(new THREE.Quaternion())),
       restDirectionInRoot: restDirection.applyQuaternion(inverseRootQuaternion),
+      restPalmNormalInRoot,
     })
   }
+  return retargetBones
 }
 
-function rotateBoneToward(name: string, directionInRoot: THREE.Vector3, strength: number): void {
-  const restPose = retargetBones.get(name)
-  if (!restPose || !playerAvatar || directionInRoot.lengthSq() < 0.0001) return
+function rotateBoneToward(rig: AvatarRig, name: string, directionInRoot: THREE.Vector3, strength: number): void {
+  const restPose = rig.bones.get(name)
+  if (!restPose || directionInRoot.lengthSq() < 0.0001) return
 
-  const rootWorldQuaternion = playerAvatar.getWorldQuaternion(new THREE.Quaternion())
+  const rootWorldQuaternion = rig.avatar.getWorldQuaternion(new THREE.Quaternion())
   const restDirectionWorld = restPose.restDirectionInRoot.clone().applyQuaternion(rootWorldQuaternion).normalize()
   const targetDirectionWorld = directionInRoot.clone().applyQuaternion(rootWorldQuaternion).normalize()
   const correction = new THREE.Quaternion().setFromUnitVectors(restDirectionWorld, targetDirectionWorld)
@@ -192,23 +278,108 @@ function rotateBoneToward(name: string, directionInRoot: THREE.Vector3, strength
   restPose.bone.updateWorldMatrix(false, true)
 }
 
+function orientBoneWithPalm(
+  rig: AvatarRig,
+  name: string,
+  forwardInRoot: THREE.Vector3,
+  palmNormalInRoot: THREE.Vector3,
+  strength: number,
+): void {
+  const restPose = rig.bones.get(name)
+  if (!restPose || forwardInRoot.lengthSq() < 0.0001) return
+
+  const rootWorldQuaternion = rig.avatar.getWorldQuaternion(new THREE.Quaternion())
+  const restDirectionWorld = restPose.restDirectionInRoot.clone().applyQuaternion(rootWorldQuaternion).normalize()
+  const targetDirectionWorld = forwardInRoot.clone().normalize().applyQuaternion(rootWorldQuaternion).normalize()
+  const align = new THREE.Quaternion().setFromUnitVectors(restDirectionWorld, targetDirectionWorld)
+  const restWorldQuaternion = rootWorldQuaternion.clone().multiply(restPose.restQuaternionInRoot)
+  let targetWorldQuaternion = align.clone().multiply(restWorldQuaternion)
+
+  const alignedPalmWorld = restPose.restPalmNormalInRoot
+    .clone()
+    .applyQuaternion(rootWorldQuaternion)
+    .applyQuaternion(align)
+    .normalize()
+  const desiredPalmWorld = palmNormalInRoot.clone().normalize().applyQuaternion(rootWorldQuaternion).normalize()
+  const alignedPlane = alignedPalmWorld.addScaledVector(targetDirectionWorld, -alignedPalmWorld.dot(targetDirectionWorld))
+  const desiredPlane = desiredPalmWorld.addScaledVector(targetDirectionWorld, -desiredPalmWorld.dot(targetDirectionWorld))
+  if (alignedPlane.lengthSq() > 0.0001 && desiredPlane.lengthSq() > 0.0001) {
+    const twist = new THREE.Quaternion().setFromUnitVectors(alignedPlane.normalize(), desiredPlane.normalize())
+    targetWorldQuaternion = twist.multiply(targetWorldQuaternion)
+  }
+
+  const blendedWorldQuaternion = restWorldQuaternion.clone().slerp(targetWorldQuaternion, strength)
+  const parentWorldQuaternion = restPose.bone.parent!.getWorldQuaternion(new THREE.Quaternion())
+  restPose.bone.quaternion.copy(parentWorldQuaternion.invert().multiply(blendedWorldQuaternion))
+  restPose.bone.updateWorldMatrix(false, true)
+}
+
+function solveArm(
+  rig: AvatarRig,
+  upperArmName: string,
+  foreArmName: string,
+  shoulder: THREE.Vector3,
+  elbow: THREE.Vector3,
+  wrist: THREE.Vector3,
+): void {
+  const upperArm = rig.bones.get(upperArmName)
+  const foreArm = rig.bones.get(foreArmName)
+  if (!upperArm || !foreArm) return
+
+  const shoulderWorld = upperArm.bone.getWorldPosition(new THREE.Vector3())
+  const elbowWorld = foreArm.bone.getWorldPosition(new THREE.Vector3())
+  const wristWorld = foreArm.childBone.getWorldPosition(new THREE.Vector3())
+  const upperArmLength = shoulderWorld.distanceTo(elbowWorld)
+  const foreArmLength = elbowWorld.distanceTo(wristWorld)
+  const sourceUpperArm = elbow.clone().sub(shoulder)
+  const sourceForeArm = wrist.clone().sub(elbow)
+  const sourceWrist = wrist.clone().sub(shoulder)
+  const sourceReach = sourceUpperArm.length() + sourceForeArm.length()
+  if (upperArmLength < 0.001 || foreArmLength < 0.001 || sourceReach < 0.001) return
+
+  const reach = upperArmLength + foreArmLength
+  const minimumReach = Math.abs(upperArmLength - foreArmLength) + 0.001
+  const targetDistance = THREE.MathUtils.clamp(sourceWrist.length() / sourceReach * reach, minimumReach, reach - 0.001)
+  const targetDirection = sourceWrist.normalize()
+  const targetWorld = shoulderWorld.clone().addScaledVector(targetDirection.applyQuaternion(rig.avatar.getWorldQuaternion(new THREE.Quaternion())), targetDistance)
+  const shoulderToTarget = targetWorld.clone().sub(shoulderWorld)
+  const shoulderToTargetLength = shoulderToTarget.length()
+  if (shoulderToTargetLength < 0.001) return
+
+  const axis = shoulderToTarget.normalize()
+  const sourceElbowDirection = sourceUpperArm.normalize().applyQuaternion(rig.avatar.getWorldQuaternion(new THREE.Quaternion()))
+  const elbowPlane = sourceElbowDirection.addScaledVector(axis, -sourceElbowDirection.dot(axis))
+  if (elbowPlane.lengthSq() < 0.0001) elbowPlane.copy(new THREE.Vector3(0, 1, 0).cross(axis))
+  elbowPlane.normalize()
+
+  const elbowAlongAxis = (upperArmLength ** 2 - foreArmLength ** 2 + shoulderToTargetLength ** 2) / (2 * shoulderToTargetLength)
+  const elbowOffset = Math.sqrt(Math.max(0, upperArmLength ** 2 - elbowAlongAxis ** 2))
+  const solvedElbowWorld = shoulderWorld.clone()
+    .addScaledVector(axis, elbowAlongAxis)
+    .addScaledVector(elbowPlane, elbowOffset)
+  const inverseRootQuaternion = rig.avatar.getWorldQuaternion(new THREE.Quaternion()).invert()
+
+  rotateBoneToward(rig, upperArmName, solvedElbowWorld.sub(shoulderWorld).applyQuaternion(inverseRootQuaternion), 1)
+  rotateBoneToward(rig, foreArmName, targetWorld.sub(foreArm.bone.getWorldPosition(new THREE.Vector3())).applyQuaternion(inverseRootQuaternion), 1)
+}
+
 function poseToAvatarSpace(point: PosePoint, shoulderCenter: PosePoint, shoulderWidth: number): THREE.Vector3 {
   return new THREE.Vector3(
-    (shoulderCenter.x - point.x) / shoulderWidth,
+    (point.x - shoulderCenter.x) / shoulderWidth,
     (shoulderCenter.y - point.y) / shoulderWidth,
     (shoulderCenter.z - point.z) / shoulderWidth,
   )
 }
 
-function applyUpperBodyPose(): void {
-  if (!trackingActive || !playerAvatar || !latestPose || retargetBones.size === 0) return
+function applyUpperBodyPose(rig: AvatarRig | undefined, pose: TrackedPose | undefined): void {
+  if (!trackingActive || !rig || !pose || rig.bones.size === 0) return
 
-  for (const restPose of retargetBones.values()) {
+  for (const restPose of rig.bones.values()) {
     restPose.bone.quaternion.copy(restPose.restLocalQuaternion)
   }
-  playerAvatar.updateWorldMatrix(true, true)
+  rig.avatar.updateWorldMatrix(true, true)
 
-  const { leftShoulder, rightShoulder, leftElbow, rightElbow, leftWrist, rightWrist, leftHip, rightHip, shoulderWidth } = latestPose
+  const { leftShoulder, rightShoulder, leftElbow, rightElbow, leftWrist, rightWrist, leftHip, rightHip, shoulderWidth } = pose
   const shoulderCenter = {
     x: (leftShoulder.x + rightShoulder.x) / 2,
     y: (leftShoulder.y + rightShoulder.y) / 2,
@@ -227,55 +398,149 @@ function applyUpperBodyPose(): void {
   const rightWristPoint = poseToAvatarSpace(rightWrist, shoulderCenter, shoulderWidth)
   const hipCenterPoint = poseToAvatarSpace(hipCenter, shoulderCenter, shoulderWidth)
 
-  rotateBoneToward('mixamorigSpine', hipCenterPoint.clone().negate(), 0.45)
-  rotateBoneToward('mixamorigLeftArm', leftElbowPoint.sub(leftShoulderPoint), 0.9)
-  rotateBoneToward('mixamorigLeftForeArm', leftWristPoint.sub(leftElbowPoint), 0.9)
-  rotateBoneToward('mixamorigRightArm', rightElbowPoint.sub(rightShoulderPoint), 0.9)
-  rotateBoneToward('mixamorigRightForeArm', rightWristPoint.sub(rightElbowPoint), 0.9)
+  rotateBoneToward(rig, 'mixamorigSpine', hipCenterPoint.clone().negate(), 0.45)
+  solveArm(rig, 'mixamorigLeftArm', 'mixamorigLeftForeArm', leftShoulderPoint, leftElbowPoint, leftWristPoint)
+  solveArm(rig, 'mixamorigRightArm', 'mixamorigRightForeArm', rightShoulderPoint, rightElbowPoint, rightWristPoint)
 }
 
-function applyGuardPose(): void {
-  if (!playerAvatar || retargetBones.size === 0) return
+const fingerLandmarks = {
+  Thumb: [1, 2, 3, 4],
+  Index: [5, 6, 7, 8],
+  Middle: [9, 10, 11, 12],
+  Ring: [13, 14, 15, 16],
+  Pinky: [17, 18, 19, 20],
+} as const
 
-  for (const restPose of retargetBones.values()) {
+/** MediaPipe image deltas → avatar root space. Z flips so "toward camera" is character forward. */
+function mediaPipeDeltaToAvatar(from: ImagePoint, to: ImagePoint): THREE.Vector3 {
+  return new THREE.Vector3(
+    to.x - from.x,
+    from.y - to.y,
+    from.z - to.z,
+  )
+}
+
+function handPalmBasis(side: HandSide, hand: readonly ImagePoint[]): { forward: THREE.Vector3; palmNormal: THREE.Vector3 } {
+  const wrist = hand[0]
+  const index = hand[5]
+  const middle = hand[9]
+  const pinky = hand[17]
+  const forward = mediaPipeDeltaToAvatar(wrist, middle)
+  if (forward.lengthSq() < 1e-8) forward.set(0, 0, 1)
+  forward.normalize()
+
+  // Both hands use the same palm winding after conversion into avatar space.
+  const across = mediaPipeDeltaToAvatar(pinky, index)
+  let palmNormal = new THREE.Vector3().crossVectors(forward, across)
+  if (palmNormal.lengthSq() < 1e-8) {
+    palmNormal = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(side === 'left' ? -1 : 1, 0, 0))
+  }
+  if (palmNormal.lengthSq() < 1e-8) palmNormal.set(0, 0, 1)
+  palmNormal.normalize()
+
+  const correctedAcross = new THREE.Vector3().crossVectors(palmNormal, forward).normalize()
+  palmNormal.crossVectors(forward, correctedAcross).normalize()
+  return { forward, palmNormal }
+}
+
+function handForwardOffset(side: HandSide, hand: readonly ImagePoint[], poseDepth: number): number {
+  const palmSpan = Math.hypot(hand[5].x - hand[17].x, hand[5].y - hand[17].y)
+  const palmDepth = (hand[5].z + hand[9].z + hand[13].z + hand[17].z) / 4
+  const calibration = handDepthCalibration[side] ?? { wrist: { ...hand[0] }, palmSpan, palmDepth, poseDepth }
+  handDepthCalibration[side] ??= calibration
+
+  const scaleAdvance = (palmSpan / Math.max(calibration.palmSpan, 1e-4) - 1) * 3.8
+  const landmarkAdvance = (calibration.palmDepth - palmDepth) * 2.6
+  // This is deliberately amplified for the A/B test: the body owns X/Y, while both hand-depth signals visibly own Z.
+  return THREE.MathUtils.clamp(scaleAdvance + landmarkAdvance, -0.75, 2.2)
+}
+
+function applyHandDepthToPose(pose: TrackedPose, hands: TrackedHands): TrackedPose {
+  const leftOffset = hands.left ? handForwardOffset('left', hands.left, latestHandDepths.left ?? 0) : 0
+  const rightOffset = hands.right ? handForwardOffset('right', hands.right, latestHandDepths.right ?? 0) : 0
+  return {
+    ...pose,
+    leftWrist: { ...pose.leftWrist, z: pose.leftWrist.z - leftOffset * pose.shoulderWidth },
+    rightWrist: { ...pose.rightWrist, z: pose.rightWrist.z - rightOffset * pose.shoulderWidth },
+  }
+}
+
+function applyFingerPose(rig: AvatarRig, side: HandSide, hand: readonly ImagePoint[]): void {
+  const rigSide = side === 'left' ? 'Left' : 'Right'
+  const { forward, palmNormal } = handPalmBasis(side, hand)
+  orientBoneWithPalm(rig, `mixamorig${rigSide}Hand`, forward, palmNormal, 0.92)
+
+  for (const [finger, landmarks] of Object.entries(fingerLandmarks)) {
+    for (let segment = 0; segment < 3; segment += 1) {
+      const from = hand[landmarks[segment]]
+      const to = hand[landmarks[segment + 1]]
+      if (!from || !to) continue
+      rotateBoneToward(rig, `mixamorig${rigSide}Hand${finger}${segment + 1}`, mediaPipeDeltaToAvatar(from, to), 0.85)
+    }
+  }
+}
+
+function applyHandDrivenPose(
+  rig: AvatarRig | undefined,
+  hands: TrackedHands,
+): void {
+  if (!trackingActive || !rig || (!hands.left && !hands.right)) return
+  for (const [side, hand] of Object.entries(hands) as Array<[HandSide, readonly ImagePoint[] | undefined]>) {
+    if (!hand) continue
+    applyFingerPose(rig, side, hand)
+  }
+}
+
+function applyGuardPose(rig: AvatarRig | undefined): void {
+  if (!rig || rig.bones.size === 0) return
+
+  for (const restPose of rig.bones.values()) {
     restPose.bone.quaternion.copy(restPose.restLocalQuaternion)
   }
-  playerAvatar.updateWorldMatrix(true, true)
+  rig.avatar.updateWorldMatrix(true, true)
 
-  rotateBoneToward('mixamorigLeftArm', new THREE.Vector3(-0.5, 0.05, 0.7), 1)
-  rotateBoneToward('mixamorigLeftForeArm', new THREE.Vector3(0, 0.6, 0.55), 1)
-  rotateBoneToward('mixamorigRightArm', new THREE.Vector3(0.5, 0.05, 0.7), 1)
-  rotateBoneToward('mixamorigRightForeArm', new THREE.Vector3(0, 0.6, 0.55), 1)
+  rotateBoneToward(rig, 'mixamorigLeftArm', new THREE.Vector3(-0.5, 0.05, 0.7), 1)
+  rotateBoneToward(rig, 'mixamorigLeftForeArm', new THREE.Vector3(0, 0.6, 0.55), 1)
+  rotateBoneToward(rig, 'mixamorigRightArm', new THREE.Vector3(0.5, 0.05, 0.7), 1)
+  rotateBoneToward(rig, 'mixamorigRightForeArm', new THREE.Vector3(0, 0.6, 0.55), 1)
 }
 
-async function loadPlayerAvatar(): Promise<void> {
+function prepareAvatar(avatar: THREE.Group, offsetX: number): AvatarRig {
+  avatar.scale.setScalar(0.01)
+  avatar.traverse((object) => {
+    if (object instanceof THREE.Mesh) {
+      object.castShadow = true
+      object.receiveShadow = true
+    }
+  })
+  avatar.position.copy(player.position).add(new THREE.Vector3(offsetX, 0, 0))
+  avatar.rotation.copy(player.rotation)
+  scene.add(avatar)
+  avatar.updateWorldMatrix(true, true)
+  return { avatar, bones: cacheRetargetBones(avatar) }
+}
+
+async function loadPlayerAvatars(): Promise<void> {
   try {
-    const avatar = await fbxLoader.loadAsync('/assets/mixamo/character/y-bot.fbx')
-    avatar.scale.setScalar(0.01)
-    avatar.traverse((object) => {
-      if (object instanceof THREE.Mesh) {
-        object.castShadow = true
-        object.receiveShadow = true
-      }
-    })
-    avatar.position.copy(player.position)
-    avatar.rotation.copy(player.rotation)
-    scene.add(avatar)
+    const [poseModel, fusedModel] = await Promise.all([
+      fbxLoader.loadAsync('/assets/mixamo/character/y-bot.fbx'),
+      fbxLoader.loadAsync('/assets/mixamo/character/y-bot.fbx'),
+    ])
     scene.remove(player)
-    playerAvatar = avatar
-    avatar.updateWorldMatrix(true, true)
-    cacheRetargetBones(avatar)
+    poseAvatar = prepareAvatar(poseModel, -1.2)
+    playerAvatar = prepareAvatar(fusedModel, 1.2)
   } catch (error) {
-    console.error('Unable to load Y Bot', error)
+    console.error('Unable to load Y Bots', error)
   }
 }
 
-void loadPlayerAvatar()
+void loadPlayerAvatars()
 
 window.addEventListener('keydown', (event) => {
   keys.add(event.key.toLowerCase())
   if (event.key.toLowerCase() === 'r') {
-    player.position.set(0, 0, 2.2)
+    player.position.copy(PLAYER_START_POSITION)
+    player.rotation.y = PLAYER_START_ROTATION_Y
     playerStamina = 100
   }
 })
@@ -290,8 +555,16 @@ const poseConnections: ReadonlyArray<readonly [number, number]> = [
   [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24],
   [23, 25], [25, 27], [24, 26], [26, 28],
 ]
+const handConnections: ReadonlyArray<readonly [number, number]> = [
+  [0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8],
+  [0, 9], [9, 10], [10, 11], [11, 12], [0, 13], [13, 14], [14, 15], [15, 16],
+  [0, 17], [17, 18], [18, 19], [19, 20], [5, 9], [9, 13], [13, 17],
+]
 
-function drawPoseOverlay(landmarks: readonly PosePoint[] | undefined): void {
+function drawPoseOverlay(
+  landmarks: readonly PosePoint[] | undefined,
+  hands: readonly (readonly ImagePoint[])[],
+): void {
   const width = webcam.clientWidth
   const height = webcam.clientHeight
   if (poseOverlay.width !== width || poseOverlay.height !== height) {
@@ -335,6 +608,74 @@ function drawPoseOverlay(landmarks: readonly PosePoint[] | undefined): void {
     poseContext.arc(x, y, 3, 0, Math.PI * 2)
     poseContext.fill()
   }
+
+  poseContext.strokeStyle = '#f2d08d'
+  poseContext.lineWidth = 1.5
+  for (const hand of hands) {
+    for (const [firstIndex, secondIndex] of handConnections) {
+      const first = hand[firstIndex]
+      const second = hand[secondIndex]
+      if (!first || !second) continue
+      const [firstX, firstY] = pointFor(first)
+      const [secondX, secondY] = pointFor(second)
+      poseContext.beginPath()
+      poseContext.moveTo(firstX, firstY)
+      poseContext.lineTo(secondX, secondY)
+      poseContext.stroke()
+    }
+    poseContext.fillStyle = '#f2d08d'
+    for (const landmark of hand) {
+      if (!landmark) continue
+      const [x, y] = pointFor(landmark)
+      poseContext.beginPath()
+      poseContext.arc(x, y, 1.75, 0, Math.PI * 2)
+      poseContext.fill()
+    }
+  }
+}
+
+function assignHandsToSides(imageLandmarks: readonly ImagePoint[]): TrackedHands {
+  const assigned: TrackedHands = {}
+  const unused: number[] = []
+
+  for (let index = 0; index < latestHandLandmarks.length; index += 1) {
+    const label = latestHandLabels[index]
+    const hand = latestHandLandmarks[index]
+    if (!hand) continue
+    if (label === 'Left' && !assigned.left) {
+      assigned.left = hand
+      continue
+    }
+    if (label === 'Right' && !assigned.right) {
+      assigned.right = hand
+      continue
+    }
+    unused.push(index)
+  }
+
+  const nearestUnused = (wrist: ImagePoint): number => unused.reduce((nearestIndex, index) => {
+    if (nearestIndex === -1) return index
+    const hand = latestHandLandmarks[index]
+    const nearest = latestHandLandmarks[nearestIndex]
+    if (!hand?.[0] || !nearest?.[0]) return nearestIndex
+    const distance = Math.hypot(hand[0].x - wrist.x, hand[0].y - wrist.y)
+    const nearestDistance = Math.hypot(nearest[0].x - wrist.x, nearest[0].y - wrist.y)
+    return distance < nearestDistance ? index : nearestIndex
+  }, -1)
+
+  if (!assigned.left) {
+    const leftIndex = nearestUnused(imageLandmarks[15])
+    if (leftIndex >= 0) {
+      assigned.left = latestHandLandmarks[leftIndex]
+      unused.splice(unused.indexOf(leftIndex), 1)
+    }
+  }
+  if (!assigned.right) {
+    const rightIndex = nearestUnused(imageLandmarks[16])
+    if (rightIndex >= 0) assigned.right = latestHandLandmarks[rightIndex]
+  }
+
+  return assigned
 }
 
 async function startCamera(): Promise<void> {
@@ -354,11 +695,25 @@ async function startCamera(): Promise<void> {
       runningMode: 'VIDEO',
       numPoses: 1,
     })
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      numHands: 2,
+      minHandDetectionConfidence: 0.55,
+      minHandPresenceConfidence: 0.55,
+      minTrackingConfidence: 0.5,
+    })
     webcam.srcObject = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
     })
     await webcam.play()
+    handDepthCalibration.left = undefined
+    handDepthCalibration.right = undefined
     trackingActive = true
     cameraButton.textContent = 'Camera ativa'
     setTrackingStatus('procurando postura...')
@@ -376,43 +731,63 @@ function updateTrackedGloves(): void {
   if (webcam.currentTime === lastVideoTime) return
 
   lastVideoTime = webcam.currentTime
-  const result = poseLandmarker.detectForVideo(webcam, performance.now())
-  const landmarks = result.landmarks[0]
-  drawPoseOverlay(landmarks)
-  if (!landmarks) {
+  const timestamp = performance.now()
+  const result = poseLandmarker.detectForVideo(webcam, timestamp)
+  if (handLandmarker) {
+    const handResult = handLandmarker.detectForVideo(webcam, timestamp)
+    latestHandLandmarks = handResult.landmarks as readonly (readonly ImagePoint[])[]
+    latestHandLabels = handResult.handednesses.map((categories) => {
+      const name = categories[0]?.categoryName
+      return name === 'Left' || name === 'Right' ? name : undefined
+    })
+  }
+  const imageLandmarks = result.landmarks[0]
+  const worldLandmarks = result.worldLandmarks[0]
+  drawPoseOverlay(imageLandmarks, latestHandLandmarks)
+  if (!imageLandmarks || !worldLandmarks) {
     setTrackingStatus('corpo fora do quadro')
     return
   }
 
-  const leftShoulder = landmarks[11]
-  const rightShoulder = landmarks[12]
-  const leftWrist = landmarks[15]
-  const rightWrist = landmarks[16]
-  const leftElbow = landmarks[13]
-  const rightElbow = landmarks[14]
-  const leftHip = landmarks[23]
-  const rightHip = landmarks[24]
+  const leftShoulder = worldLandmarks[11]
+  const rightShoulder = worldLandmarks[12]
   const shoulderWidth = Math.abs(leftShoulder.x - rightShoulder.x)
+  const poseLeftWrist = worldLandmarks[15]
+  const poseRightWrist = worldLandmarks[16]
+  const leftElbow = worldLandmarks[13]
+  const rightElbow = worldLandmarks[14]
+  const leftHip = worldLandmarks[23]
+  const rightHip = worldLandmarks[24]
+  latestTrackedHands = assignHandsToSides(imageLandmarks)
+  const shoulderDepth = (leftShoulder.z + rightShoulder.z) / 2
+  latestHandDepths = {
+    left: (shoulderDepth - poseLeftWrist.z) / shoulderWidth,
+    right: (shoulderDepth - poseRightWrist.z) / shoulderWidth,
+  }
   const torsoVisibility = Math.min(
-    leftShoulder.visibility ?? 0,
-    rightShoulder.visibility ?? 0,
-    leftHip.visibility ?? 0,
-    rightHip.visibility ?? 0,
+    imageLandmarks[11].visibility ?? 0,
+    imageLandmarks[12].visibility ?? 0,
+    imageLandmarks[23].visibility ?? 0,
+    imageLandmarks[24].visibility ?? 0,
   )
-  const wristVisibility = Math.min(leftWrist.visibility ?? 0, rightWrist.visibility ?? 0)
+  const wristVisibility = Math.min(imageLandmarks[15].visibility ?? 0, imageLandmarks[16].visibility ?? 0)
 
   if (shoulderWidth < 0.08 || torsoVisibility < 0.45) {
     setTrackingStatus('mostre tronco e ombros')
     return
   }
   if (wristVisibility < 0.45) {
-    latestPose = undefined
-    setTrackingStatus('mostre as maos para os bracos')
+    latestPoseOnly = undefined
+    latestPoseWithHandDepth = undefined
+    setTrackingStatus(latestTrackedHands.left || latestTrackedHands.right ? 'maos ativas; mostre os bracos para comparar' : 'mostre as maos para os bracos')
     return
   }
 
-  latestPose = { leftShoulder, rightShoulder, leftElbow, rightElbow, leftWrist, rightWrist, leftHip, rightHip, shoulderWidth }
-  setTrackingStatus('rastreamento ativo', true)
+  latestPoseOnly = {
+    leftShoulder, rightShoulder, leftElbow, rightElbow, leftWrist: poseLeftWrist, rightWrist: poseRightWrist, leftHip, rightHip, shoulderWidth,
+  }
+  latestPoseWithHandDepth = applyHandDepthToPose(latestPoseOnly, latestTrackedHands)
+  setTrackingStatus(latestHandLandmarks.length ? 'corpo e maos ativos' : 'rastreamento corporal ativo', true)
 }
 
 function punch(fighter: THREE.Group, gloveName: string, amount: number): void {
@@ -446,24 +821,36 @@ function animate(time: number): void {
     playerStamina = Math.min(100, playerStamina + 12 * delta)
   }
 
+  if (poseAvatar) {
+    poseAvatar.avatar.position.copy(player.position).add(new THREE.Vector3(-1.2, 0, 0))
+    poseAvatar.avatar.rotation.copy(player.rotation)
+  }
   if (playerAvatar) {
-    playerAvatar.position.copy(player.position)
-    playerAvatar.rotation.copy(player.rotation)
+    playerAvatar.avatar.position.copy(player.position).add(new THREE.Vector3(1.2, 0, 0))
+    playerAvatar.avatar.rotation.copy(player.rotation)
   }
 
-  const cameraOffset = new THREE.Vector3(-1.15, 2.05, -3.4).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.rotation.y)
-  const cameraTarget = player.position.clone().add(new THREE.Vector3(0, 1.25, 0.35))
+  const verticalAxis = new THREE.Vector3(0, 1, 0)
+  const cameraOffset = new THREE.Vector3(-1.15, 2.05, -3.4)
+    .applyAxisAngle(verticalAxis, player.rotation.y + cameraOrbitYaw)
+    .applyAxisAngle(new THREE.Vector3(1, 0, 0).applyAxisAngle(verticalAxis, player.rotation.y + cameraOrbitYaw), cameraOrbitPitch)
+  const cameraTarget = player.position
+    .clone()
+    .add(new THREE.Vector3(0, 1.25, 0.35).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.rotation.y))
   camera.position.lerp(player.position.clone().add(cameraOffset), 1 - Math.exp(-7 * delta))
   camera.lookAt(cameraTarget)
 
   updateTrackedGloves()
-  if (trackingActive && latestPose) {
-    applyUpperBodyPose()
+  if (trackingActive && latestPoseOnly) {
+    applyUpperBodyPose(poseAvatar, latestPoseOnly)
+    applyUpperBodyPose(playerAvatar, latestPoseWithHandDepth)
   } else {
-    applyGuardPose()
+    applyGuardPose(poseAvatar)
+    applyGuardPose(playerAvatar)
     punch(player, 'left-glove', keys.has('j') && playerStamina >= 5 ? 0.9 : 0.08)
     punch(player, 'right-glove', keys.has('k') && playerStamina >= 7 ? 1.05 : 0.08)
   }
+  if (trackingActive) applyHandDrivenPose(playerAvatar, latestTrackedHands)
   updateHud()
   renderer.render(scene, camera)
   requestAnimationFrame(animate)
