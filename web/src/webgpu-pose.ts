@@ -37,14 +37,21 @@ async function seek(video: HTMLVideoElement, time: number): Promise<void> {
   await completed
 }
 
-function getVideoDuration(video: HTMLVideoElement): number {
+function playableDuration(video: HTMLVideoElement): number | undefined {
+  if (!video.seekable.length) return undefined
+  const end = video.seekable.end(video.seekable.length - 1)
+  const start = video.seekable.start(0)
+  return Number.isFinite(end) && end > start ? end - start : undefined
+}
+
+function getVideoDuration(video: HTMLVideoElement, fallbackDuration?: number): number {
   if (Number.isFinite(video.duration) && video.duration > 0) return video.duration
-  if (video.seekable.length) {
-    const end = video.seekable.end(video.seekable.length - 1)
-    const start = video.seekable.start(0)
-    if (Number.isFinite(end) && end > start) return end - start
+  const availableDuration = playableDuration(video)
+  if (availableDuration) return availableDuration
+  if (fallbackDuration !== undefined && Number.isFinite(fallbackDuration) && fallbackDuration > 0) {
+    return fallbackDuration
   }
-  throw new Error('O video nao informa uma duracao finita. Recarregue a gravacao antes de processar.')
+  throw new Error('O video nao informa uma duracao utilizavel. Grave novamente ou carregue um arquivo de video.')
 }
 
 type InputGeometry = {
@@ -287,8 +294,12 @@ export type WebGpuPoseResult = {
 }
 
 /** Sample video with RTMPose (+ crop pass), then lift with MotionAGFormer. */
-export async function processWithWebGpu(video: HTMLVideoElement, onProgress: ProgressHandler): Promise<WebGpuPoseResult> {
-  const duration = getVideoDuration(video)
+export async function processWithWebGpu(
+  video: HTMLVideoElement,
+  onProgress: ProgressHandler,
+  fallbackDuration?: number,
+): Promise<WebGpuPoseResult> {
+  const duration = getVideoDuration(video, fallbackDuration)
   if (!video.videoWidth) throw new Error('Video invalido para processamento WebGPU.')
   onProgress('Carregando RTMPose no navegador', 5)
   const rtmpose = await loadSession('rtmpose')

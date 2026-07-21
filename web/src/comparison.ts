@@ -3,6 +3,7 @@ import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision'
 import * as THREE from 'three'
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js'
 import { clone } from 'three/addons/utils/SkeletonUtils.js'
+import { ArrayBufferTarget, Muxer } from 'mp4-muxer'
 import {
   connectionsFor,
   projectH36mToSticker,
@@ -22,6 +23,8 @@ import {
   type AvatarRig,
 } from './pose-retarget'
 import { getSampleTimes, processWithWebGpu, SAMPLE_FPS, seekVideo, type WebPoseFrame } from './webgpu-pose'
+
+declare const MediaStreamTrackProcessor: new (init: { track: MediaStreamTrack }) => { readable: ReadableStream<VideoFrame> }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -165,9 +168,11 @@ let view: 'avatar' | 'skeleton' = 'avatar'
 let poseLandmarker: PoseLandmarker | undefined
 let modelLoading: Promise<void> | undefined
 let cameraStream: MediaStream | undefined
-let recorder: MediaRecorder | undefined
-let recordingChunks: Blob[] = []
+type CameraRecorder = { stop: () => Promise<Blob> }
+let cameraRecorder: CameraRecorder | undefined
 let sourceBlob: Blob | undefined
+let sourceDuration: number | undefined
+let recordingStartedAt = 0
 let labFrames: Partial<Record<PipelineKey, LabPoseFrame[]>> = {}
 let comparisonReady = false
 
@@ -195,8 +200,11 @@ function formatTime(seconds: number): string {
 }
 
 function updateTimeline(): void {
+  const duration = Number.isFinite(sourceVideo.duration) && sourceVideo.duration > 0
+    ? sourceVideo.duration
+    : sourceDuration ?? 0
   timeline.value = String(sourceVideo.currentTime)
-  timeOutput.value = `${formatTime(sourceVideo.currentTime)} / ${formatTime(sourceVideo.duration)}`
+  timeOutput.value = `${formatTime(sourceVideo.currentTime)} / ${formatTime(duration)}`
 }
 
 function createAvatarPreview(canvas: HTMLCanvasElement): AvatarPreview {
@@ -269,7 +277,59 @@ function clearCameraStream(): void {
   cameraStream = undefined
 }
 
-function loadVideoSource(url: string, label: string, blob: Blob): void {
+function createCameraRecorder(stream: MediaStream): CameraRecorder {
+  const track = stream.getVideoTracks()[0]
+  if (!track) throw new Error('A camera nao forneceu uma faixa de video.')
+  const settings = track.getSettings()
+  const width = settings.width || 1280
+  const height = settings.height || 720
+  const target = new ArrayBufferTarget()
+  const muxer = new Muxer({
+    target,
+    video: { codec: 'avc', width, height },
+    fastStart: 'in-memory',
+    firstTimestampBehavior: 'offset',
+  })
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
+    error: (error) => console.error('Camera MP4 encoder failed', error),
+  })
+  encoder.configure({
+    codec: 'avc1.42001f',
+    width,
+    height,
+    bitrate: 3_000_000,
+    framerate: settings.frameRate || 30,
+    avc: { format: 'avc' },
+  })
+  const processor = new MediaStreamTrackProcessor({ track })
+  const reader = processor.readable.getReader()
+  let stopping = false
+  let frameCount = 0
+  const pump = (async () => {
+    while (!stopping) {
+      const { done, value } = await reader.read()
+      if (done) break
+      encoder.encode(value, { keyFrame: frameCount++ % 60 === 0 })
+      value.close()
+    }
+  })()
+  return {
+    stop: async () => {
+      stopping = true
+      await reader.cancel()
+      await pump.catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        throw error
+      })
+      await encoder.flush()
+      muxer.finalize()
+      return new Blob([target.buffer], { type: 'video/mp4' })
+    },
+  }
+}
+
+function loadVideoSource(url: string, label: string, blob: Blob, duration?: number): void {
   clearCameraStream()
   if (videoUrl) URL.revokeObjectURL(videoUrl)
   videoUrl = url
@@ -277,6 +337,7 @@ function loadVideoSource(url: string, label: string, blob: Blob): void {
   comparisonReady = false
   processingStatus.hidden = true
   sourceBlob = blob
+  sourceDuration = duration
   sourceVideo.srcObject = null
   sourceVideo.src = url
   sourceVideo.load()
@@ -308,11 +369,12 @@ function updateProcessingStatus(job: ProcessJob): void {
 }
 
 async function startRecording(): Promise<void> {
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+  if (!navigator.mediaDevices?.getUserMedia || !('VideoEncoder' in window) || !('MediaStreamTrackProcessor' in window)) {
     runStatus.textContent = 'gravacao indisponivel neste navegador'
     return
   }
   try {
+    comparisonReady = false
     runStatus.textContent = 'carregando MediaPipe'
     await loadMediaPipe()
     cameraStream = await navigator.mediaDevices.getUserMedia({
@@ -324,24 +386,8 @@ async function startRecording(): Promise<void> {
     sourceVideo.muted = true
     await sourceVideo.play()
     videoEmpty.hidden = true
-    recorder = new MediaRecorder(
-      cameraStream,
-      MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? { mimeType: 'video/webm;codecs=vp9' } : undefined,
-    )
-    recordingChunks = []
-    recorder.addEventListener('dataavailable', (event) => { if (event.data.size) recordingChunks.push(event.data) })
-    recorder.addEventListener('stop', () => {
-      const recording = new Blob(recordingChunks, { type: recorder?.mimeType || 'video/webm' })
-      loadVideoSource(
-        URL.createObjectURL(recording),
-        `gravacao-${new Date().toLocaleTimeString('pt-BR').replaceAll(':', '-')}.webm`,
-        recording,
-      )
-      runStatus.textContent = 'gravacao pronta para comparar'
-      recordButton.disabled = false
-      stopRecordingButton.disabled = true
-    })
-    recorder.start(250)
+    cameraRecorder = createCameraRecorder(cameraStream)
+    recordingStartedAt = performance.now()
     recordButton.disabled = true
     stopRecordingButton.disabled = false
     runStatus.textContent = 'gravando camera'
@@ -350,6 +396,30 @@ async function startRecording(): Promise<void> {
     console.error('Unable to record camera', error)
     clearCameraStream()
     runStatus.textContent = 'acesso a camera negado'
+  }
+}
+
+async function stopRecording(): Promise<void> {
+  if (!cameraRecorder) return
+  stopRecordingButton.disabled = true
+  runStatus.textContent = 'finalizando MP4'
+  try {
+    const recording = await cameraRecorder.stop()
+    const duration = Math.max(.1, (performance.now() - recordingStartedAt) / 1000)
+    cameraRecorder = undefined
+    loadVideoSource(
+      URL.createObjectURL(recording),
+      `gravacao-${new Date().toLocaleTimeString('pt-BR').replaceAll(':', '-')}.mp4`,
+      recording,
+      duration,
+    )
+    runStatus.textContent = 'gravacao pronta para comparar'
+    recordButton.disabled = false
+  } catch (error) {
+    console.error('Unable to finalize camera recording', error)
+    runStatus.textContent = 'falha ao finalizar gravacao'
+    recordButton.disabled = false
+    stopRecordingButton.disabled = true
   }
 }
 
@@ -458,7 +528,7 @@ async function processComparison(): Promise<void> {
         progress: 22 + Math.round(progress * 0.76),
         detail,
       })
-    })
+    }, sourceDuration)
 
     const hybrid = labFramesFromHybrid(webGpu.rtmpose, webGpu.motionagformer)
     labFrames = {
@@ -596,11 +666,14 @@ videoInput.addEventListener('change', () => {
 })
 
 recordButton.addEventListener('click', () => { void startRecording() })
-stopRecordingButton.addEventListener('click', () => recorder?.state === 'recording' && recorder.stop())
+stopRecordingButton.addEventListener('click', () => { void stopRecording() })
 processButton.addEventListener('click', () => { void processComparison() })
 
 sourceVideo.addEventListener('loadedmetadata', () => {
-  timeline.max = String(sourceVideo.duration)
+  const duration = Number.isFinite(sourceVideo.duration) && sourceVideo.duration > 0
+    ? sourceVideo.duration
+    : sourceDuration ?? 0
+  timeline.max = String(Math.max(duration, 0.001))
   timeline.disabled = false
   playButton.disabled = false
   processButton.disabled = false
