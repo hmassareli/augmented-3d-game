@@ -35,20 +35,23 @@ async function seek(video: HTMLVideoElement, time: number): Promise<void> {
   await completed
 }
 
-function getVideoDuration(video: HTMLVideoElement): number {
-  if (Number.isFinite(video.duration) && video.duration > 0) return video.duration
-  if (video.seekable.length) {
-    const end = video.seekable.end(video.seekable.length - 1)
-    const start = video.seekable.start(0)
-    if (Number.isFinite(end) && end > start) return end - start
-  }
-  throw new Error('O video nao informa uma duracao finita. Recarregue a gravacao antes de processar.')
+function playableDuration(video: HTMLVideoElement): number | undefined {
+  if (!video.seekable.length) return undefined
+  const end = video.seekable.end(video.seekable.length - 1)
+  const start = video.seekable.start(0)
+  return Number.isFinite(end) && end > start ? end - start : undefined
 }
 
-function makeInput(video: HTMLVideoElement, canvas: HTMLCanvasElement): { tensor: ort.Tensor; scaleX: number; scaleY: number; offsetX: number; offsetY: number; videoWidth: number; videoHeight: number } {
+async function getVideoDuration(video: HTMLVideoElement, fallbackDuration?: number): Promise<number> {
+  if (Number.isFinite(video.duration) && video.duration > 0) return video.duration
+  const availableDuration = playableDuration(video)
+  if (availableDuration) return availableDuration
+  if (fallbackDuration !== undefined && Number.isFinite(fallbackDuration) && fallbackDuration > 0) return fallbackDuration
+  throw new Error('O video nao informa uma duracao utilizavel. Grave novamente ou carregue um arquivo de video.')
+}
+
+function makeInput(image: CanvasImageSource, videoWidth: number, videoHeight: number, canvas: HTMLCanvasElement): { tensor: ort.Tensor; scaleX: number; scaleY: number; offsetX: number; offsetY: number; videoWidth: number; videoHeight: number } {
   const context = canvas.getContext('2d', { willReadFrequently: true })!
-  const videoWidth = video.videoWidth
-  const videoHeight = video.videoHeight
   const targetAspect = RTMPOSE_WIDTH / RTMPOSE_HEIGHT
   const padding = 1.25
   const sourceWidth = Math.max(videoWidth, videoHeight * targetAspect) * padding
@@ -56,7 +59,7 @@ function makeInput(video: HTMLVideoElement, canvas: HTMLCanvasElement): { tensor
   const offsetX = (videoWidth - sourceWidth) / 2
   const offsetY = (videoHeight - sourceHeight) / 2
   context.clearRect(0, 0, RTMPOSE_WIDTH, RTMPOSE_HEIGHT)
-  context.drawImage(video, offsetX * RTMPOSE_WIDTH / sourceWidth, offsetY * RTMPOSE_HEIGHT / sourceHeight, videoWidth * RTMPOSE_WIDTH / sourceWidth, videoHeight * RTMPOSE_HEIGHT / sourceHeight)
+  context.drawImage(image, offsetX * RTMPOSE_WIDTH / sourceWidth, offsetY * RTMPOSE_HEIGHT / sourceHeight, videoWidth * RTMPOSE_WIDTH / sourceWidth, videoHeight * RTMPOSE_HEIGHT / sourceHeight)
   const pixels = context.getImageData(0, 0, RTMPOSE_WIDTH, RTMPOSE_HEIGHT).data
   const data = new Float32Array(3 * RTMPOSE_WIDTH * RTMPOSE_HEIGHT)
   const means = [123.675, 116.28, 103.53]
@@ -93,7 +96,7 @@ function decodeRtmpose(outputs: Record<string, ort.Tensor>, geometry: ReturnType
       x: (xIndex / 2 / RTMPOSE_WIDTH * geometry.scaleX + geometry.offsetX) / geometry.videoWidth,
       y: (yIndex / 2 / RTMPOSE_HEIGHT * geometry.scaleY + geometry.offsetY) / geometry.videoHeight,
       z: 0,
-      visibility: Math.min(xScore, yScore),
+      visibility: 1,
     })
   }
   return points
@@ -118,7 +121,9 @@ function normalized3d(points: Float32Array): WebPosePoint[] {
   const rootZ = points[2]
   let scale = 1e-5
   for (let index = 0; index < 17; index += 1) scale = Math.max(scale, Math.hypot(points[index * 3] - rootX, points[index * 3 + 1] - rootY, points[index * 3 + 2] - rootZ))
-  return Array.from({ length: 17 }, (_, index) => ({ x: (points[index * 3] - rootX) / scale, y: (points[index * 3 + 1] - rootY) / scale, z: (points[index * 3 + 2] - rootZ) / scale, visibility: 1 }))
+  const h36m = Array.from({ length: 17 }, (_, index) => ({ x: (points[index * 3] - rootX) / scale, y: (points[index * 3 + 1] - rootY) / scale, z: (points[index * 3 + 2] - rootZ) / scale, visibility: 1 }))
+  const h36mIndexForCoco = [9, 9, 9, 9, 9, 11, 14, 12, 15, 13, 16, 4, 1, 5, 2, 6, 3]
+  return h36mIndexForCoco.map((index) => h36m[index])
 }
 
 async function runTemporal(name: 'motionbert' | 'motionagformer', sequence: Float32Array[], frames: WebPoseFrame[]): Promise<WebPoseFrame[]> {
@@ -136,8 +141,8 @@ async function runTemporal(name: 'motionbert' | 'motionagformer', sequence: Floa
   return output
 }
 
-export async function processWithWebGpu(video: HTMLVideoElement, onProgress: ProgressHandler): Promise<Record<string, WebPoseFrame[]>> {
-  const duration = getVideoDuration(video)
+export async function processWithWebGpu(video: HTMLVideoElement, onProgress: ProgressHandler, fallbackDuration?: number): Promise<Record<string, WebPoseFrame[]>> {
+  const duration = await getVideoDuration(video, fallbackDuration)
   if (!video.videoWidth) throw new Error('Video invalido para processamento WebGPU.')
   onProgress('Carregando RTMPose no navegador', 5)
   const rtmpose = await loadSession('rtmpose')
@@ -150,7 +155,7 @@ export async function processWithWebGpu(video: HTMLVideoElement, onProgress: Pro
   const sampleCount = Math.max(1, Math.ceil(duration * SAMPLE_FPS))
   for (let index = 0; index < sampleCount; index += 1) {
     await seek(video, Math.min(index / SAMPLE_FPS, Math.max(0, duration - .001)))
-    const geometry = makeInput(video, canvas)
+    const geometry = makeInput(video, video.videoWidth, video.videoHeight, canvas)
     const result = await rtmpose.run({ [rtmpose.inputNames[0]]: geometry.tensor })
     const landmarks = decodeRtmpose(result, geometry)
     frames.push({ time: video.currentTime, landmarks })

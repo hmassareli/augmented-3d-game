@@ -3,7 +3,10 @@ import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision'
 import * as THREE from 'three'
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js'
 import { clone } from 'three/addons/utils/SkeletonUtils.js'
+import { ArrayBufferTarget, Muxer } from 'mp4-muxer'
 import { processWithWebGpu } from './webgpu-pose'
+
+declare const MediaStreamTrackProcessor: new (init: { track: MediaStreamTrack }) => { readable: ReadableStream<VideoFrame> }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -109,9 +112,12 @@ let lastInferenceTime = -1
 type Landmark = { x: number; y: number; visibility?: number }
 let mediaPipeLandmarks: readonly Landmark[] | undefined
 let cameraStream: MediaStream | undefined
-let recorder: MediaRecorder | undefined
-let recordingChunks: Blob[] = []
+type CameraRecorder = { stop: () => Promise<Blob> }
+let cameraRecorder: CameraRecorder | undefined
 let sourceBlob: Blob | undefined
+let sourceDuration: number | undefined
+let recordingStartedAt = 0
+let comparisonReady = false
 type PoseFrame = { time: number; landmarks: readonly Landmark[] | null }
 let backendFrames: Partial<Record<string, PoseFrame[]>> = {}
 
@@ -126,17 +132,19 @@ type AvatarPreview = { renderer: THREE.WebGLRenderer; scene: THREE.Scene; camera
 const avatarPreviews: AvatarPreview[] = []
 const avatarLoader = new FBXLoader()
 let avatarTemplate: THREE.Group | undefined
-let hookClip: THREE.AnimationClip | undefined
-let lastAvatarRenderTime = performance.now()
 
 function formatTime(seconds: number): string {
   const wholeSeconds = Number.isFinite(seconds) ? Math.floor(seconds) : 0
   return `${String(Math.floor(wholeSeconds / 60)).padStart(2, '0')}:${String(wholeSeconds % 60).padStart(2, '0')}`
 }
 
+function effectiveDuration(): number {
+  return Number.isFinite(sourceVideo.duration) && sourceVideo.duration > 0 ? sourceVideo.duration : sourceDuration ?? 0
+}
+
 function updateTimeline(): void {
   timeline.value = String(sourceVideo.currentTime)
-  timeOutput.value = `${formatTime(sourceVideo.currentTime)} / ${formatTime(sourceVideo.duration)}`
+  timeOutput.value = `${formatTime(sourceVideo.currentTime)} / ${formatTime(effectiveDuration())}`
 }
 
 function createAvatarPreview(canvas: HTMLCanvasElement): AvatarPreview {
@@ -172,12 +180,7 @@ function cacheRestPose(avatar: THREE.Group): void {
 
 async function loadAvatars(): Promise<void> {
   if (avatarTemplate) return
-  const [loadedAvatar, hookAnimation] = await Promise.all([
-    avatarLoader.loadAsync('/assets/mixamo/character/y-bot.fbx'),
-    avatarLoader.loadAsync('/assets/mixamo/animations/hook.fbx'),
-  ])
-  avatarTemplate = loadedAvatar
-  hookClip = hookAnimation.animations[0]
+  avatarTemplate = await avatarLoader.loadAsync('/assets/mixamo/character/y-bot.fbx')
   avatarTemplate.scale.setScalar(.01)
   cacheRestPose(avatarTemplate)
   avatarPreviews.forEach((preview, index) => {
@@ -186,12 +189,6 @@ async function loadAvatars(): Promise<void> {
     avatar.rotation.y = Math.PI
     avatar.userData.phase = index * .64
     preview.avatar = avatar
-    if (hookClip) {
-      preview.mixer = new THREE.AnimationMixer(avatar)
-      const action = preview.mixer.clipAction(hookClip)
-      action.time = index * .11
-      action.play()
-    }
     preview.scene.add(avatar)
   })
 }
@@ -212,6 +209,12 @@ function rotateArm(avatar: THREE.Group, side: 'Left' | 'Right', swing: number, e
   if (forearm instanceof THREE.Bone) forearm.rotation.z += direction * elbow
 }
 
+function rotateLeg(avatar: THREE.Group, side: 'Left' | 'Right', swing: number): void {
+  const leg = avatar.getObjectByName(`mixamorig${side}UpLeg`)
+  const direction = side === 'Left' ? -1 : 1
+  if (leg instanceof THREE.Bone) leg.rotation.x += direction * swing
+}
+
 function landmarksFor(index: number): readonly Landmark[] | undefined {
   const frames = backendFrames[modelDefinitions[index].pipeline]
   if (frames?.length) {
@@ -221,27 +224,54 @@ function landmarksFor(index: number): readonly Landmark[] | undefined {
   return index === 0 ? mediaPipeLandmarks : undefined
 }
 
-function poseAvatar(avatar: THREE.Group, index: number, time: number): void {
-  const phase = time * 2.4 + Number(avatar.userData.phase)
-  avatar.rotation.y = Math.PI + Math.sin(phase * .35) * .12
+type PosePoint = { x: number; y: number; visibility: number }
 
+function posePoints(index: number, landmarks: readonly Landmark[]): PosePoint[] {
+  if (index < 2) return landmarks.map((landmark) => ({ x: landmark.x, y: landmark.y, visibility: landmark.visibility ?? 1 }))
+
+  const visible = landmarks.filter((landmark) => (landmark.visibility ?? 1) >= .35)
+  if (!visible.length) return []
+  const minX = Math.min(...visible.map((landmark) => landmark.x))
+  const maxX = Math.max(...visible.map((landmark) => landmark.x))
+  const minY = Math.min(...visible.map((landmark) => landmark.y))
+  const maxY = Math.max(...visible.map((landmark) => landmark.y))
+  const centerX = (minX + maxX) / 2
+  const centerY = (minY + maxY) / 2
+  const scale = Math.max(maxX - minX, maxY - minY, .01)
+  return landmarks.map((landmark) => ({
+    x: .5 + (landmark.x - centerX) / scale * .34,
+    y: .56 - (landmark.y - centerY) / scale * .34,
+    visibility: landmark.visibility ?? 1,
+  }))
+}
+
+function poseAvatar(avatar: THREE.Group, index: number, _time: number): void {
+  avatar.rotation.y = Math.PI
+  resetAvatarPose(avatar)
   const landmarks = landmarksFor(index)
   if (landmarks) {
-    resetAvatarPose(avatar)
+    const points = posePoints(index, landmarks)
     const spine = avatar.getObjectByName('mixamorigSpine')
-    if (spine instanceof THREE.Bone) spine.rotation.y = Math.sin(phase * .7) * .12
-    const leftShoulder = landmarks[5] ?? landmarks[11]
-    const leftElbow = landmarks[7] ?? landmarks[13]
-    const rightShoulder = landmarks[6] ?? landmarks[12]
-    const rightElbow = landmarks[8] ?? landmarks[14]
-    if (leftShoulder && leftElbow) rotateArm(avatar, 'Left', (leftElbow.y - leftShoulder.y) * 2.2, .75)
-    if (rightShoulder && rightElbow) rotateArm(avatar, 'Right', (rightElbow.y - rightShoulder.y) * 2.2, .75)
+    const isMediaPipe = index === 0
+    const leftShoulder = points[isMediaPipe ? 11 : 5]
+    const leftElbow = points[isMediaPipe ? 13 : 7]
+    const leftWrist = points[isMediaPipe ? 15 : 9]
+    const rightShoulder = points[isMediaPipe ? 12 : 6]
+    const rightElbow = points[isMediaPipe ? 14 : 8]
+    const rightWrist = points[isMediaPipe ? 16 : 10]
+    const leftHip = points[isMediaPipe ? 23 : 11]
+    const leftKnee = points[isMediaPipe ? 25 : 13]
+    const rightHip = points[isMediaPipe ? 24 : 12]
+    const rightKnee = points[isMediaPipe ? 26 : 14]
+    if (spine instanceof THREE.Bone && leftShoulder && rightShoulder) spine.rotation.y = (rightShoulder.x - leftShoulder.x) * .7
+    if (leftShoulder && leftElbow) rotateArm(avatar, 'Left', (leftElbow.y - leftShoulder.y) * 6, leftWrist ? (leftWrist.y - leftElbow.y) * 5 : 0)
+    if (rightShoulder && rightElbow) rotateArm(avatar, 'Right', (rightElbow.y - rightShoulder.y) * 6, rightWrist ? (rightWrist.y - rightElbow.y) * 5 : 0)
+    if (leftHip && leftKnee) rotateLeg(avatar, 'Left', (leftKnee.y - leftHip.y - .2) * 3)
+    if (rightHip && rightKnee) rotateLeg(avatar, 'Right', (rightKnee.y - rightHip.y - .2) * 3)
   }
 }
 
 function renderAvatars(time: number): void {
-  const delta = Math.min((performance.now() - lastAvatarRenderTime) / 1000, .05)
-  lastAvatarRenderTime = performance.now()
   for (const preview of avatarPreviews) {
     const canvas = preview.renderer.domElement
     const bounds = canvas.getBoundingClientRect()
@@ -252,7 +282,6 @@ function renderAvatars(time: number): void {
       preview.camera.aspect = bounds.width / bounds.height
       preview.camera.updateProjectionMatrix()
     }
-    preview.mixer?.update(delta)
     if (preview.avatar) poseAvatar(preview.avatar, avatarPreviews.indexOf(preview), time)
     preview.renderer.render(preview.scene, preview.camera)
   }
@@ -263,15 +292,72 @@ function clearCameraStream(): void {
   cameraStream = undefined
 }
 
-function loadVideoSource(url: string, label: string, blob: Blob): void {
+function createCameraRecorder(stream: MediaStream): CameraRecorder {
+  const track = stream.getVideoTracks()[0]
+  if (!track) throw new Error('A camera nao forneceu uma faixa de video.')
+  const settings = track.getSettings()
+  const width = settings.width || 1280
+  const height = settings.height || 720
+  const target = new ArrayBufferTarget()
+  const muxer = new Muxer({
+    target,
+    video: { codec: 'avc', width, height },
+    fastStart: 'in-memory',
+    firstTimestampBehavior: 'offset',
+  })
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
+    error: (error) => console.error('Camera MP4 encoder failed', error),
+  })
+  encoder.configure({
+    codec: 'avc1.42001f',
+    width,
+    height,
+    bitrate: 3_000_000,
+    framerate: settings.frameRate || 30,
+    avc: { format: 'avc' },
+  })
+  const processor = new MediaStreamTrackProcessor({ track })
+  const reader = processor.readable.getReader()
+  let stopping = false
+  let frameCount = 0
+  const pump = (async () => {
+    while (!stopping) {
+      const { done, value } = await reader.read()
+      if (done) break
+      encoder.encode(value, { keyFrame: frameCount++ % 60 === 0 })
+      value.close()
+    }
+  })()
+  return {
+    stop: async () => {
+      stopping = true
+      await reader.cancel()
+      await pump.catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        throw error
+      })
+      await encoder.flush()
+      muxer.finalize()
+      return new Blob([target.buffer], { type: 'video/mp4' })
+    },
+  }
+}
+
+function loadVideoSource(url: string, label: string, blob: Blob, duration?: number): void {
   clearCameraStream()
   if (videoUrl) URL.revokeObjectURL(videoUrl)
   videoUrl = url
   lastInferenceTime = -1
   mediaPipeLandmarks = undefined
   backendFrames = {}
+  comparisonReady = false
   processingStatus.hidden = true
   sourceBlob = blob
+  sourceDuration = duration
+  timeline.disabled = true
+  playButton.disabled = true
+  processButton.disabled = true
   sourceVideo.srcObject = null
   sourceVideo.src = url
   sourceVideo.load()
@@ -293,11 +379,12 @@ function updateProcessingStatus(job: ProcessJob): void {
 }
 
 async function startRecording(): Promise<void> {
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+  if (!navigator.mediaDevices?.getUserMedia || !('VideoEncoder' in window) || !('MediaStreamTrackProcessor' in window)) {
     runStatus.textContent = 'gravacao indisponivel neste navegador'
     return
   }
   try {
+    comparisonReady = false
     runStatus.textContent = 'carregando MediaPipe'
     await loadMediaPipe()
     cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false })
@@ -306,17 +393,8 @@ async function startRecording(): Promise<void> {
     sourceVideo.muted = true
     await sourceVideo.play()
     videoEmpty.hidden = true
-    recorder = new MediaRecorder(cameraStream, MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? { mimeType: 'video/webm;codecs=vp9' } : undefined)
-    recordingChunks = []
-    recorder.addEventListener('dataavailable', (event) => { if (event.data.size) recordingChunks.push(event.data) })
-    recorder.addEventListener('stop', () => {
-      const recording = new Blob(recordingChunks, { type: recorder?.mimeType || 'video/webm' })
-      loadVideoSource(URL.createObjectURL(recording), `gravacao-${new Date().toLocaleTimeString('pt-BR').replaceAll(':', '-')}.webm`, recording)
-      runStatus.textContent = 'gravacao pronta para comparar'
-      recordButton.disabled = false
-      stopRecordingButton.disabled = true
-    })
-    recorder.start(250)
+    cameraRecorder = createCameraRecorder(cameraStream)
+    recordingStartedAt = performance.now()
     recordButton.disabled = true
     stopRecordingButton.disabled = false
     runStatus.textContent = 'gravando camera'
@@ -325,6 +403,24 @@ async function startRecording(): Promise<void> {
     console.error('Unable to record camera', error)
     clearCameraStream()
     runStatus.textContent = 'acesso a camera negado'
+  }
+}
+
+async function stopRecording(): Promise<void> {
+  if (!cameraRecorder) return
+  stopRecordingButton.disabled = true
+  runStatus.textContent = 'finalizando MP4'
+  try {
+    const recording = await cameraRecorder.stop()
+    const duration = Math.max(.1, (performance.now() - recordingStartedAt) / 1000)
+    cameraRecorder = undefined
+    loadVideoSource(URL.createObjectURL(recording), `gravacao-${new Date().toLocaleTimeString('pt-BR').replaceAll(':', '-')}.mp4`, recording, duration)
+    runStatus.textContent = 'validando gravacao MP4'
+  } catch (error) {
+    console.error('Unable to finalize camera recording', error)
+    runStatus.textContent = 'falha ao finalizar gravacao'
+    recordButton.disabled = false
+    stopRecordingButton.disabled = true
   }
 }
 
@@ -337,7 +433,7 @@ async function processWithWebGpuOnly(): Promise<void> {
     const webGpuPipelines = await processWithWebGpu(sourceVideo, (detail, progress) => {
       const stage = detail.startsWith('MotionBERT') ? 'motionbert' : detail.startsWith('MotionAGFormer') ? 'motionagformer' : 'rtmpose'
       updateProcessingStatus({ status: 'processing', stage, progress, detail })
-    })
+    }, sourceDuration)
     backendFrames = {
       mediapipe: [],
       rtmpose: webGpuPipelines.rtmpose,
@@ -354,6 +450,7 @@ async function processWithWebGpuOnly(): Promise<void> {
     document.querySelectorAll<HTMLElement>('.model-card').forEach((card) => card.classList.remove('is-processing'))
     updateProcessingStatus({ status: 'complete', stage: 'complete', progress: 100, detail: 'Quatro pipelines WebGPU concluidos' })
     runStatus.textContent = 'comparacao WebGPU pronta'
+    comparisonReady = true
     renderPoses()
   } catch (error) {
     console.error('Unable to process video with WebGPU', error)
@@ -445,17 +542,15 @@ function drawPlaceholder(canvas: HTMLCanvasElement, index: number, time: number)
 
   const landmarks = landmarksFor(index)
   if (landmarks) {
+    const points = posePoints(index, landmarks)
     const point = (landmarkIndex: number): [number, number] | undefined => {
-      const landmark = landmarks[landmarkIndex]
-      if (!landmark || (landmark.visibility ?? 1) < 0.35) return undefined
-      const isTemporal = index >= 2
-      const x = isTemporal ? .5 + landmark.x * .3 : landmark.x
-      const y = isTemporal ? .58 - landmark.y * .3 : landmark.y
-      return [x * bounds.width, y * bounds.height]
+      const landmark = points[landmarkIndex]
+      if (!landmark || landmark.visibility < .02) return undefined
+      return [landmark.x * bounds.width, landmark.y * bounds.height]
     }
     const connections: ReadonlyArray<readonly [number, number]> = index === 0
       ? [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 25], [25, 27], [24, 26], [26, 28]]
-      : [[5, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16]]
+      : [[0, 5], [0, 6], [5, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16]]
     context.strokeStyle = accent
     for (const [fromIndex, toIndex] of connections) {
       const from = point(fromIndex)
@@ -510,7 +605,7 @@ function drawPlaceholder(canvas: HTMLCanvasElement, index: number, time: number)
 
 function renderPoses(): void {
   const time = sourceVideo.currentTime || 0
-  detectMediaPipePose()
+  if (comparisonReady) detectMediaPipePose()
   canvasElements.forEach((canvas, index) => drawPlaceholder(canvas, index, time))
   if (view === 'avatar') renderAvatars(time)
   if (!sourceVideo.paused && !sourceVideo.ended) requestAnimationFrame(renderPoses)
@@ -534,17 +629,29 @@ videoInput.addEventListener('change', () => {
 })
 
 recordButton.addEventListener('click', () => { void startRecording() })
-stopRecordingButton.addEventListener('click', () => recorder?.state === 'recording' && recorder.stop())
+stopRecordingButton.addEventListener('click', () => { void stopRecording() })
 processButton.addEventListener('click', () => { void processWithWebGpuOnly() })
 
 sourceVideo.addEventListener('loadedmetadata', () => {
-  timeline.max = String(sourceVideo.duration)
+  timeline.max = String(effectiveDuration())
   timeline.disabled = false
   playButton.disabled = false
-  processButton.disabled = false
   videoEmpty.hidden = true
   updateTimeline()
   renderPoses()
+})
+
+sourceVideo.addEventListener('loadeddata', () => {
+  processButton.disabled = false
+  runStatus.textContent = 'video pronto para comparar'
+})
+
+sourceVideo.addEventListener('error', () => {
+  processButton.disabled = true
+  playButton.disabled = true
+  timeline.disabled = true
+  runStatus.textContent = 'gravacao nao pode ser aberta'
+  processingDetail.textContent = 'O navegador nao conseguiu decodificar esta gravacao. Grave novamente.'
 })
 
 sourceVideo.addEventListener('timeupdate', updateTimeline)
