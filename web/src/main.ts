@@ -26,10 +26,6 @@ app.innerHTML = `
       <div class="camera-panel__status"><i id="tracking-dot"></i><span id="tracking-status">camera desligada</span></div>
       <button id="camera-button" type="button">Ativar camera</button>
     </section>
-    <section class="comparison-legend" aria-label="Comparação dos rastreadores">
-      <span><i class="comparison-legend__pose"></i>ESQUERDA: CORPO</span>
-      <span><i class="comparison-legend__fused"></i>DIREITA: MAOS -&gt; IK</span>
-    </section>
     <footer class="hud controls">WASD move &nbsp; · &nbsp; J jab &nbsp; · &nbsp; K cross &nbsp; · &nbsp; R reset</footer>
   </main>
 `
@@ -136,16 +132,10 @@ type TrackedHands = {
   left?: readonly ImagePoint[]
   right?: readonly ImagePoint[]
 }
-type HandDepths = {
-  left?: number
-  right?: number
-}
 type HandSide = 'left' | 'right'
 
-let poseAvatar: AvatarRig | undefined
 let playerAvatar: AvatarRig | undefined
-let latestPoseOnly: TrackedPose | undefined
-let latestPoseWithHandDepth: TrackedPose | undefined
+let latestPose: TrackedPose | undefined
 
 const keys = new Set<string>()
 const webcam = document.querySelector<HTMLVideoElement>('#webcam')!
@@ -165,11 +155,6 @@ let trackingActive = false
 let latestHandLandmarks: readonly (readonly ImagePoint[])[] = []
 let latestHandLabels: Array<'Left' | 'Right' | undefined> = []
 let latestTrackedHands: TrackedHands = {}
-let latestHandDepths: HandDepths = {}
-const handDepthCalibration: Record<HandSide, { wrist: ImagePoint; palmSpan: number; palmDepth: number; poseDepth: number } | undefined> = {
-  left: undefined,
-  right: undefined,
-}
 
 canvas.addEventListener('pointerdown', (event) => {
   if (event.button !== 0) return
@@ -443,28 +428,6 @@ function handPalmBasis(side: HandSide, hand: readonly ImagePoint[]): { forward: 
   return { forward, palmNormal }
 }
 
-function handForwardOffset(side: HandSide, hand: readonly ImagePoint[], poseDepth: number): number {
-  const palmSpan = Math.hypot(hand[5].x - hand[17].x, hand[5].y - hand[17].y)
-  const palmDepth = (hand[5].z + hand[9].z + hand[13].z + hand[17].z) / 4
-  const calibration = handDepthCalibration[side] ?? { wrist: { ...hand[0] }, palmSpan, palmDepth, poseDepth }
-  handDepthCalibration[side] ??= calibration
-
-  const scaleAdvance = (palmSpan / Math.max(calibration.palmSpan, 1e-4) - 1) * 3.8
-  const landmarkAdvance = (calibration.palmDepth - palmDepth) * 2.6
-  // This is deliberately amplified for the A/B test: the body owns X/Y, while both hand-depth signals visibly own Z.
-  return THREE.MathUtils.clamp(scaleAdvance + landmarkAdvance, -0.75, 2.2)
-}
-
-function applyHandDepthToPose(pose: TrackedPose, hands: TrackedHands): TrackedPose {
-  const leftOffset = hands.left ? handForwardOffset('left', hands.left, latestHandDepths.left ?? 0) : 0
-  const rightOffset = hands.right ? handForwardOffset('right', hands.right, latestHandDepths.right ?? 0) : 0
-  return {
-    ...pose,
-    leftWrist: { ...pose.leftWrist, z: pose.leftWrist.z - leftOffset * pose.shoulderWidth },
-    rightWrist: { ...pose.rightWrist, z: pose.rightWrist.z - rightOffset * pose.shoulderWidth },
-  }
-}
-
 function applyFingerPose(rig: AvatarRig, side: HandSide, hand: readonly ImagePoint[]): void {
   const rigSide = side === 'left' ? 'Left' : 'Right'
   const { forward, palmNormal } = handPalmBasis(side, hand)
@@ -505,7 +468,7 @@ function applyGuardPose(rig: AvatarRig | undefined): void {
   rotateBoneToward(rig, 'mixamorigRightForeArm', new THREE.Vector3(0, 0.6, 0.55), 1)
 }
 
-function prepareAvatar(avatar: THREE.Group, offsetX: number): AvatarRig {
+function prepareAvatar(avatar: THREE.Group): AvatarRig {
   avatar.scale.setScalar(0.01)
   avatar.traverse((object) => {
     if (object instanceof THREE.Mesh) {
@@ -513,28 +476,24 @@ function prepareAvatar(avatar: THREE.Group, offsetX: number): AvatarRig {
       object.receiveShadow = true
     }
   })
-  avatar.position.copy(player.position).add(new THREE.Vector3(offsetX, 0, 0))
+  avatar.position.copy(player.position)
   avatar.rotation.copy(player.rotation)
   scene.add(avatar)
   avatar.updateWorldMatrix(true, true)
   return { avatar, bones: cacheRetargetBones(avatar) }
 }
 
-async function loadPlayerAvatars(): Promise<void> {
+async function loadPlayerAvatar(): Promise<void> {
   try {
-    const [poseModel, fusedModel] = await Promise.all([
-      fbxLoader.loadAsync('/assets/mixamo/character/y-bot.fbx'),
-      fbxLoader.loadAsync('/assets/mixamo/character/y-bot.fbx'),
-    ])
+    const avatar = await fbxLoader.loadAsync('/assets/mixamo/character/y-bot.fbx')
     scene.remove(player)
-    poseAvatar = prepareAvatar(poseModel, -1.2)
-    playerAvatar = prepareAvatar(fusedModel, 1.2)
+    playerAvatar = prepareAvatar(avatar)
   } catch (error) {
-    console.error('Unable to load Y Bots', error)
+    console.error('Unable to load Y Bot', error)
   }
 }
 
-void loadPlayerAvatars()
+void loadPlayerAvatar()
 
 window.addEventListener('keydown', (event) => {
   keys.add(event.key.toLowerCase())
@@ -689,7 +648,7 @@ async function startCamera(): Promise<void> {
     poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
       baseOptions: {
         modelAssetPath:
-          'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+          'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task',
         delegate: 'GPU',
       },
       runningMode: 'VIDEO',
@@ -712,8 +671,6 @@ async function startCamera(): Promise<void> {
       audio: false,
     })
     await webcam.play()
-    handDepthCalibration.left = undefined
-    handDepthCalibration.right = undefined
     trackingActive = true
     cameraButton.textContent = 'Camera ativa'
     setTrackingStatus('procurando postura...')
@@ -759,11 +716,6 @@ function updateTrackedGloves(): void {
   const leftHip = worldLandmarks[23]
   const rightHip = worldLandmarks[24]
   latestTrackedHands = assignHandsToSides(imageLandmarks)
-  const shoulderDepth = (leftShoulder.z + rightShoulder.z) / 2
-  latestHandDepths = {
-    left: (shoulderDepth - poseLeftWrist.z) / shoulderWidth,
-    right: (shoulderDepth - poseRightWrist.z) / shoulderWidth,
-  }
   const torsoVisibility = Math.min(
     imageLandmarks[11].visibility ?? 0,
     imageLandmarks[12].visibility ?? 0,
@@ -777,16 +729,23 @@ function updateTrackedGloves(): void {
     return
   }
   if (wristVisibility < 0.45) {
-    latestPoseOnly = undefined
-    latestPoseWithHandDepth = undefined
-    setTrackingStatus(latestTrackedHands.left || latestTrackedHands.right ? 'maos ativas; mostre os bracos para comparar' : 'mostre as maos para os bracos')
+    latestPose = undefined
+    setTrackingStatus('mostre as maos para os bracos')
     return
   }
 
-  latestPoseOnly = {
-    leftShoulder, rightShoulder, leftElbow, rightElbow, leftWrist: poseLeftWrist, rightWrist: poseRightWrist, leftHip, rightHip, shoulderWidth,
+  latestPose = {
+    leftShoulder,
+    rightShoulder,
+    leftElbow,
+    rightElbow,
+    // Pose supplies the arm's full 3D target. Hand Landmarker remains local to palm orientation and fingers.
+    leftWrist: poseLeftWrist,
+    rightWrist: poseRightWrist,
+    leftHip,
+    rightHip,
+    shoulderWidth,
   }
-  latestPoseWithHandDepth = applyHandDepthToPose(latestPoseOnly, latestTrackedHands)
   setTrackingStatus(latestHandLandmarks.length ? 'corpo e maos ativos' : 'rastreamento corporal ativo', true)
 }
 
@@ -821,12 +780,8 @@ function animate(time: number): void {
     playerStamina = Math.min(100, playerStamina + 12 * delta)
   }
 
-  if (poseAvatar) {
-    poseAvatar.avatar.position.copy(player.position).add(new THREE.Vector3(-1.2, 0, 0))
-    poseAvatar.avatar.rotation.copy(player.rotation)
-  }
   if (playerAvatar) {
-    playerAvatar.avatar.position.copy(player.position).add(new THREE.Vector3(1.2, 0, 0))
+    playerAvatar.avatar.position.copy(player.position)
     playerAvatar.avatar.rotation.copy(player.rotation)
   }
 
@@ -841,11 +796,9 @@ function animate(time: number): void {
   camera.lookAt(cameraTarget)
 
   updateTrackedGloves()
-  if (trackingActive && latestPoseOnly) {
-    applyUpperBodyPose(poseAvatar, latestPoseOnly)
-    applyUpperBodyPose(playerAvatar, latestPoseWithHandDepth)
+  if (trackingActive && latestPose) {
+    applyUpperBodyPose(playerAvatar, latestPose)
   } else {
-    applyGuardPose(poseAvatar)
     applyGuardPose(playerAvatar)
     punch(player, 'left-glove', keys.has('j') && playerStamina >= 5 ? 0.9 : 0.08)
     punch(player, 'right-glove', keys.has('k') && playerStamina >= 7 ? 1.05 : 0.08)
