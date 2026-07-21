@@ -1,0 +1,1 @@
+mean_uv_error=0.3480 (teal=detection gold=tracked-reprojected)

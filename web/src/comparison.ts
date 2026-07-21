@@ -3,7 +3,25 @@ import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision'
 import * as THREE from 'three'
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js'
 import { clone } from 'three/addons/utils/SkeletonUtils.js'
-import { processWithWebGpu } from './webgpu-pose'
+import {
+  connectionsFor,
+  projectH36mToSticker,
+  trackedFromBlazePoseWorld,
+  trackedFromCoco2d,
+  trackedFromH36m3d,
+  trackedFromHybrid,
+  type LabPoseFrame,
+  type StickerLandmark,
+  type Topology,
+} from './pose-adapters'
+import { smoothLabFrames } from './pose-filter'
+import {
+  applyGuardPose,
+  applyUpperBodyPose,
+  prepareAvatarRig,
+  type AvatarRig,
+} from './pose-retarget'
+import { getSampleTimes, processWithWebGpu, SAMPLE_FPS, seekVideo, type WebPoseFrame } from './webgpu-pose'
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -11,15 +29,15 @@ app.innerHTML = `
   <main class="lab-shell">
     <header class="lab-header">
       <a class="brand" href="/" aria-label="Voltar ao Counterpunch">COUNTERPUNCH <span>LAB</span></a>
-      <p>COMPARADOR DE RASTREAMENTO 3D</p>
+      <p>BAKE-OFF PARA O JOGO</p>
       <div class="run-status"><i></i><span id="run-status">aguardando video</span></div>
     </header>
 
     <section class="source-zone" aria-labelledby="source-title">
       <div class="source-copy">
         <p class="section-kicker">FONTE</p>
-        <h1 id="source-title">Movimento em uma tomada.</h1>
-        <p>Carregue um video curto de corpo inteiro para reproduzir a estimativa de cada pipeline no mesmo tempo.</p>
+        <h1 id="source-title">Seis experimentos. Mesmo video.</h1>
+        <p>Baseline MediaPipe vs RTMPose, lift puro, hybrid XY-lock, filtro temporal e crop top-down — mesmo sampling e mesmo IK Mixamo.</p>
         <div class="source-actions">
           <label class="file-button" for="video-input">Carregar video</label>
           <button id="record-button" class="record-button" type="button">Gravar camera</button>
@@ -31,7 +49,7 @@ app.innerHTML = `
         <section id="processing-status" class="processing-status" aria-live="polite" hidden>
           <div><span id="processing-stage">Na fila</span><strong id="processing-percent">0%</strong></div>
           <progress id="processing-progress" max="100" value="0">0%</progress>
-          <p id="processing-detail">O video sera analisado por um pipeline de cada vez.</p>
+          <p id="processing-detail">MediaPipe + RTMPose + hybrid/crop no mesmo sampling.</p>
         </section>
       </div>
       <div class="video-frame">
@@ -46,12 +64,12 @@ app.innerHTML = `
     </section>
 
     <section class="compare-toolbar" aria-label="Controles da comparacao">
-      <div class="model-count"><strong>04</strong><span>pipelines</span></div>
+      <div class="model-count"><strong>06</strong><span>candidatos</span></div>
       <div class="view-toggle" role="group" aria-label="Visualizacao dos resultados">
         <button type="button" class="is-active" data-view="avatar">MODELO 3D</button>
         <button type="button" data-view="skeleton">STICKER</button>
       </div>
-      <p id="pipeline-note" class="pipeline-note">Verificando backend de inferencia...</p>
+      <p id="pipeline-note" class="pipeline-note">Verificando WebGPU...</p>
     </section>
 
     <section id="model-grid" class="model-grid" aria-label="Resultados dos modelos"></section>
@@ -61,17 +79,57 @@ app.innerHTML = `
 const labShell = document.querySelector<HTMLElement>('.lab-shell')!
 
 const modelDefinitions = [
-  { name: 'MediaPipe', score: '★★★', color: '#5cd5bf', pipeline: 'mediapipe' },
-  { name: 'RTMPose', score: '★★★★', color: '#e6bd68', pipeline: 'rtmpose' },
-  { name: 'RTMPose + MotionBERT', score: '★★★★★', color: '#7da9f5', pipeline: 'motionbert' },
-  { name: 'RTMPose + MotionAGFormer', score: '★★★★★+', color: '#cb91dc', pipeline: 'motionagformer' },
-]
+  {
+    name: 'MediaPipe',
+    score: 'live Z',
+    color: '#5cd5bf',
+    pipeline: 'mediapipe',
+    blurb: 'world landmarks nativos',
+  },
+  {
+    name: 'RTMPose',
+    score: '2D+Z*',
+    color: '#e6bd68',
+    pipeline: 'rtmpose',
+    blurb: 'heuristica mildDepth',
+  },
+  {
+    name: 'AGFormer puro',
+    score: 'lift 3D',
+    color: '#7da9f5',
+    pipeline: 'agformer_pure',
+    blurb: 'H36M raw → IK',
+  },
+  {
+    name: 'Hybrid XY+Z',
+    score: 'XY lock',
+    color: '#d67ad4',
+    pipeline: 'hybrid',
+    blurb: 'RTM XY + AGFormer Z',
+  },
+  {
+    name: 'Hybrid + filtro',
+    score: 'OneEuro',
+    color: '#f0a06a',
+    pipeline: 'hybrid_smooth',
+    blurb: 'hybrid + bone lengths',
+  },
+  {
+    name: 'Crop + Hybrid',
+    score: 'top-down',
+    color: '#8fd18a',
+    pipeline: 'crop_hybrid',
+    blurb: 'bbox → RTM → hybrid',
+  },
+] as const
+
+type PipelineKey = (typeof modelDefinitions)[number]['pipeline']
 
 const modelGrid = document.querySelector<HTMLDivElement>('#model-grid')!
 modelGrid.innerHTML = modelDefinitions.map((model, index) => `
-  <article class="model-card" style="--accent: ${model.color}; --delay: ${index * 0.13}s">
+  <article class="model-card" style="--accent: ${model.color}; --delay: ${index * 0.08}s">
     <header>
-      <div><p>INFERENCIA REAL</p><h2>${model.name}</h2></div>
+      <div><p>${model.blurb}</p><h2>${model.name}</h2></div>
       <strong>${model.score}</strong>
     </header>
     <div class="avatar-stage">
@@ -101,19 +159,17 @@ const processingProgress = document.querySelector<HTMLProgressElement>('#process
 const processingDetail = document.querySelector<HTMLElement>('#processing-detail')!
 const canvasElements = [...document.querySelectorAll<HTMLCanvasElement>('.pose-canvas')]
 const avatarCanvases = [...document.querySelectorAll<HTMLCanvasElement>('.avatar-canvas')]
+
 let videoUrl: string | undefined
 let view: 'avatar' | 'skeleton' = 'avatar'
 let poseLandmarker: PoseLandmarker | undefined
 let modelLoading: Promise<void> | undefined
-let lastInferenceTime = -1
-type Landmark = { x: number; y: number; visibility?: number }
-let mediaPipeLandmarks: readonly Landmark[] | undefined
 let cameraStream: MediaStream | undefined
 let recorder: MediaRecorder | undefined
 let recordingChunks: Blob[] = []
 let sourceBlob: Blob | undefined
-type PoseFrame = { time: number; landmarks: readonly Landmark[] | null }
-let backendFrames: Partial<Record<string, PoseFrame[]>> = {}
+let labFrames: Partial<Record<PipelineKey, LabPoseFrame[]>> = {}
+let comparisonReady = false
 
 type ProcessJob = {
   status: 'processing' | 'complete' | 'failed'
@@ -122,12 +178,16 @@ type ProcessJob = {
   detail: string
 }
 
-type AvatarPreview = { renderer: THREE.WebGLRenderer; scene: THREE.Scene; camera: THREE.PerspectiveCamera; avatar?: THREE.Group; mixer?: THREE.AnimationMixer }
+type AvatarPreview = {
+  renderer: THREE.WebGLRenderer
+  scene: THREE.Scene
+  camera: THREE.PerspectiveCamera
+  rig?: AvatarRig
+}
+
 const avatarPreviews: AvatarPreview[] = []
 const avatarLoader = new FBXLoader()
 let avatarTemplate: THREE.Group | undefined
-let hookClip: THREE.AnimationClip | undefined
-let lastAvatarRenderTime = performance.now()
 
 function formatTime(seconds: number): string {
   const wholeSeconds = Number.isFinite(seconds) ? Math.floor(seconds) : 0
@@ -160,88 +220,35 @@ function createAvatarPreview(canvas: HTMLCanvasElement): AvatarPreview {
   return { renderer, scene, camera }
 }
 
-function cacheRestPose(avatar: THREE.Group): void {
-  avatar.traverse((object) => {
-    if (object instanceof THREE.Bone) object.userData.restQuaternion = object.quaternion.clone()
-    if (object instanceof THREE.Mesh) {
-      object.castShadow = true
-      object.receiveShadow = true
-    }
-  })
-}
-
 async function loadAvatars(): Promise<void> {
   if (avatarTemplate) return
-  const [loadedAvatar, hookAnimation] = await Promise.all([
-    avatarLoader.loadAsync('/assets/mixamo/character/y-bot.fbx'),
-    avatarLoader.loadAsync('/assets/mixamo/animations/hook.fbx'),
-  ])
-  avatarTemplate = loadedAvatar
-  hookClip = hookAnimation.animations[0]
-  avatarTemplate.scale.setScalar(.01)
-  cacheRestPose(avatarTemplate)
-  avatarPreviews.forEach((preview, index) => {
+  avatarTemplate = await avatarLoader.loadAsync('/assets/mixamo/character/y-bot.fbx')
+  avatarPreviews.forEach((preview) => {
     const avatar = clone(avatarTemplate!) as THREE.Group
     avatar.position.y = 0
     avatar.rotation.y = Math.PI
-    avatar.userData.phase = index * .64
-    preview.avatar = avatar
-    if (hookClip) {
-      preview.mixer = new THREE.AnimationMixer(avatar)
-      const action = preview.mixer.clipAction(hookClip)
-      action.time = index * .11
-      action.play()
-    }
     preview.scene.add(avatar)
+    preview.rig = prepareAvatarRig(avatar)
   })
 }
 
-function resetAvatarPose(avatar: THREE.Group): void {
-  avatar.traverse((object) => {
-    if (object instanceof THREE.Bone && object.userData.restQuaternion instanceof THREE.Quaternion) {
-      object.quaternion.copy(object.userData.restQuaternion)
-    }
-  })
+function nearestFrame(frames: LabPoseFrame[] | undefined, time: number): LabPoseFrame | undefined {
+  if (!frames?.length) return undefined
+  return frames.reduce((current, frame) =>
+    Math.abs(frame.time - time) < Math.abs(current.time - time) ? frame : current)
 }
 
-function rotateArm(avatar: THREE.Group, side: 'Left' | 'Right', swing: number, elbow: number): void {
-  const arm = avatar.getObjectByName(`mixamorig${side}Arm`)
-  const forearm = avatar.getObjectByName(`mixamorig${side}ForeArm`)
-  const direction = side === 'Left' ? -1 : 1
-  if (arm instanceof THREE.Bone) arm.rotation.z += direction * swing
-  if (forearm instanceof THREE.Bone) forearm.rotation.z += direction * elbow
+function frameFor(index: number): LabPoseFrame | undefined {
+  return nearestFrame(labFrames[modelDefinitions[index].pipeline], sourceVideo.currentTime)
 }
 
-function landmarksFor(index: number): readonly Landmark[] | undefined {
-  const frames = backendFrames[modelDefinitions[index].pipeline]
-  if (frames?.length) {
-    const nearest = frames.reduce((current, frame) => Math.abs(frame.time - sourceVideo.currentTime) < Math.abs(current.time - sourceVideo.currentTime) ? frame : current)
-    return nearest.landmarks ?? undefined
-  }
-  return index === 0 ? mediaPipeLandmarks : undefined
+function poseAvatar(rig: AvatarRig, index: number): void {
+  const frame = frameFor(index)
+  if (frame?.tracked) applyUpperBodyPose(rig, frame.tracked)
+  else applyGuardPose(rig)
 }
 
-function poseAvatar(avatar: THREE.Group, index: number, time: number): void {
-  const phase = time * 2.4 + Number(avatar.userData.phase)
-  avatar.rotation.y = Math.PI + Math.sin(phase * .35) * .12
-
-  const landmarks = landmarksFor(index)
-  if (landmarks) {
-    resetAvatarPose(avatar)
-    const spine = avatar.getObjectByName('mixamorigSpine')
-    if (spine instanceof THREE.Bone) spine.rotation.y = Math.sin(phase * .7) * .12
-    const leftShoulder = landmarks[5] ?? landmarks[11]
-    const leftElbow = landmarks[7] ?? landmarks[13]
-    const rightShoulder = landmarks[6] ?? landmarks[12]
-    const rightElbow = landmarks[8] ?? landmarks[14]
-    if (leftShoulder && leftElbow) rotateArm(avatar, 'Left', (leftElbow.y - leftShoulder.y) * 2.2, .75)
-    if (rightShoulder && rightElbow) rotateArm(avatar, 'Right', (rightElbow.y - rightShoulder.y) * 2.2, .75)
-  }
-}
-
-function renderAvatars(time: number): void {
-  const delta = Math.min((performance.now() - lastAvatarRenderTime) / 1000, .05)
-  lastAvatarRenderTime = performance.now()
+function renderAvatars(): void {
   for (const preview of avatarPreviews) {
     const canvas = preview.renderer.domElement
     const bounds = canvas.getBoundingClientRect()
@@ -252,8 +259,7 @@ function renderAvatars(time: number): void {
       preview.camera.aspect = bounds.width / bounds.height
       preview.camera.updateProjectionMatrix()
     }
-    preview.mixer?.update(delta)
-    if (preview.avatar) poseAvatar(preview.avatar, avatarPreviews.indexOf(preview), time)
+    if (preview.rig) poseAvatar(preview.rig, avatarPreviews.indexOf(preview))
     preview.renderer.render(preview.scene, preview.camera)
   }
 }
@@ -267,15 +273,16 @@ function loadVideoSource(url: string, label: string, blob: Blob): void {
   clearCameraStream()
   if (videoUrl) URL.revokeObjectURL(videoUrl)
   videoUrl = url
-  lastInferenceTime = -1
-  mediaPipeLandmarks = undefined
-  backendFrames = {}
+  labFrames = {}
+  comparisonReady = false
   processingStatus.hidden = true
   sourceBlob = blob
   sourceVideo.srcObject = null
   sourceVideo.src = url
   sourceVideo.load()
   fileName.textContent = label
+  document.querySelectorAll<HTMLElement>('.model-state').forEach((state) => { state.textContent = 'video carregado — processe' })
+  document.querySelectorAll<HTMLElement>('.frame-rate').forEach((rate) => { rate.textContent = '-- FPS' })
 }
 
 function updateProcessingStatus(job: ProcessJob): void {
@@ -286,9 +293,17 @@ function updateProcessingStatus(job: ProcessJob): void {
   processingDetail.textContent = job.detail
   pipelineNote.textContent = job.detail
   document.querySelectorAll<HTMLElement>('.model-card').forEach((card, index) => {
-    const isActive = modelDefinitions[index].pipeline === job.stage
-    card.classList.toggle('is-processing', isActive)
-    if (isActive) card.querySelector<HTMLElement>('.model-state')!.textContent = 'processando agora'
+    const pipeline = modelDefinitions[index].pipeline
+    const detail = job.detail.toLowerCase()
+    const isActive = job.stage === pipeline
+      || (pipeline === 'mediapipe' && detail.includes('mediapipe'))
+      || (pipeline === 'rtmpose' && detail.includes('rtmpose full-frame'))
+      || (pipeline === 'agformer_pure' && detail.includes('agformer') && detail.includes('full-frame'))
+      || (pipeline === 'hybrid' && detail.includes('agformer') && detail.includes('full-frame'))
+      || (pipeline === 'hybrid_smooth' && detail.includes('concluidos'))
+      || (pipeline === 'crop_hybrid' && detail.includes('crop'))
+    card.classList.toggle('is-processing', Boolean(isActive) && job.status === 'processing')
+    if (isActive && job.status === 'processing') card.querySelector<HTMLElement>('.model-state')!.textContent = 'processando agora'
   })
 }
 
@@ -300,18 +315,28 @@ async function startRecording(): Promise<void> {
   try {
     runStatus.textContent = 'carregando MediaPipe'
     await loadMediaPipe()
-    cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false })
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    })
     sourceVideo.src = ''
     sourceVideo.srcObject = cameraStream
     sourceVideo.muted = true
     await sourceVideo.play()
     videoEmpty.hidden = true
-    recorder = new MediaRecorder(cameraStream, MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? { mimeType: 'video/webm;codecs=vp9' } : undefined)
+    recorder = new MediaRecorder(
+      cameraStream,
+      MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? { mimeType: 'video/webm;codecs=vp9' } : undefined,
+    )
     recordingChunks = []
     recorder.addEventListener('dataavailable', (event) => { if (event.data.size) recordingChunks.push(event.data) })
     recorder.addEventListener('stop', () => {
       const recording = new Blob(recordingChunks, { type: recorder?.mimeType || 'video/webm' })
-      loadVideoSource(URL.createObjectURL(recording), `gravacao-${new Date().toLocaleTimeString('pt-BR').replaceAll(':', '-')}.webm`, recording)
+      loadVideoSource(
+        URL.createObjectURL(recording),
+        `gravacao-${new Date().toLocaleTimeString('pt-BR').replaceAll(':', '-')}.webm`,
+        recording,
+      )
       runStatus.textContent = 'gravacao pronta para comparar'
       recordButton.disabled = false
       stopRecordingButton.disabled = true
@@ -326,50 +351,6 @@ async function startRecording(): Promise<void> {
     clearCameraStream()
     runStatus.textContent = 'acesso a camera negado'
   }
-}
-
-async function processWithWebGpuOnly(): Promise<void> {
-  if (!sourceBlob) return
-  processButton.disabled = true
-  runStatus.textContent = 'iniciando WebGPU'
-  updateProcessingStatus({ status: 'processing', stage: 'rtmpose', progress: 0, detail: 'Preparando modelos WebGPU no navegador' })
-  try {
-    const webGpuPipelines = await processWithWebGpu(sourceVideo, (detail, progress) => {
-      const stage = detail.startsWith('MotionBERT') ? 'motionbert' : detail.startsWith('MotionAGFormer') ? 'motionagformer' : 'rtmpose'
-      updateProcessingStatus({ status: 'processing', stage, progress, detail })
-    })
-    backendFrames = {
-      mediapipe: [],
-      rtmpose: webGpuPipelines.rtmpose,
-      motionbert: webGpuPipelines.motionbert,
-      motionagformer: webGpuPipelines.motionagformer,
-    }
-    document.querySelectorAll<HTMLElement>('.model-card').forEach((card, index) => {
-      const frames = backendFrames[modelDefinitions[index].pipeline]
-      const state = card.querySelector<HTMLElement>('.model-state')
-      const frameRate = card.querySelector<HTMLElement>('.frame-rate')
-      if (state) state.textContent = index === 0 ? 'MediaPipe local no navegador' : frames?.length ? 'processado via WebGPU' : 'sem pessoa detectada'
-      if (frameRate) frameRate.textContent = 'WebGPU'
-    })
-    document.querySelectorAll<HTMLElement>('.model-card').forEach((card) => card.classList.remove('is-processing'))
-    updateProcessingStatus({ status: 'complete', stage: 'complete', progress: 100, detail: 'Quatro pipelines WebGPU concluidos' })
-    runStatus.textContent = 'comparacao WebGPU pronta'
-    renderPoses()
-  } catch (error) {
-    console.error('Unable to process video with WebGPU', error)
-    runStatus.textContent = 'falha no processamento WebGPU'
-    processingDetail.textContent = error instanceof Error ? error.message : 'Falha desconhecida durante o processamento.'
-  } finally {
-    processButton.disabled = false
-  }
-}
-
-async function checkBackend(): Promise<void> {
-  const webGpuAvailable = 'gpu' in navigator && Boolean(await navigator.gpu?.requestAdapter())
-  pipelineNote.textContent = webGpuAvailable
-    ? 'WebGPU ativo: RTMPose, MotionBERT e MotionAGFormer executam no navegador.'
-    : 'WebGPU indisponivel: os modelos usarao o fallback WASM no navegador.'
-  document.querySelectorAll<HTMLElement>('.model-state').forEach((state) => { state.textContent = 'pronto no navegador' })
 }
 
 async function loadMediaPipe(): Promise<void> {
@@ -395,20 +376,136 @@ async function loadMediaPipe(): Promise<void> {
   }
 }
 
-function detectMediaPipePose(): void {
-  const frames = backendFrames.mediapipe
-  if (frames?.length) {
-    const nearest = frames.reduce((current, frame) => Math.abs(frame.time - sourceVideo.currentTime) < Math.abs(current.time - sourceVideo.currentTime) ? frame : current)
-    mediaPipeLandmarks = nearest.landmarks ?? undefined
-    return
+async function sampleMediaPipe(video: HTMLVideoElement, onProgress: (detail: string, progress: number) => void): Promise<LabPoseFrame[]> {
+  await loadMediaPipe()
+  if (!poseLandmarker) throw new Error('MediaPipe indisponivel')
+  if (!Number.isFinite(video.duration) || video.duration <= 0) {
+    throw new Error('Video sem duracao finita para amostrar o MediaPipe.')
   }
-  if (!poseLandmarker || sourceVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
-  if (sourceVideo.currentTime === lastInferenceTime) return
-  lastInferenceTime = sourceVideo.currentTime
-  mediaPipeLandmarks = poseLandmarker.detectForVideo(sourceVideo, performance.now()).landmarks[0] as readonly Landmark[] | undefined
+  const times = getSampleTimes(video.duration)
+  const originalTime = video.currentTime
+  const frames: LabPoseFrame[] = []
+  let timestamp = 1
+  for (let index = 0; index < times.length; index += 1) {
+    await seekVideo(video, times[index])
+    timestamp += 1000 / SAMPLE_FPS
+    const result = poseLandmarker.detectForVideo(video, timestamp)
+    const image = result.landmarks[0] as StickerLandmark[] | undefined
+    const world = result.worldLandmarks[0]
+    frames.push({
+      time: video.currentTime,
+      sticker: image ? { topology: 'blazepose', landmarks: image } : null,
+      tracked: world && image ? trackedFromBlazePoseWorld(world, image) : world ? trackedFromBlazePoseWorld(world) : null,
+    })
+    onProgress(`MediaPipe: amostra ${index + 1} de ${times.length}`, Math.round(index / times.length * 100))
+  }
+  await seekVideo(video, originalTime)
+  return frames
 }
 
-function drawPlaceholder(canvas: HTMLCanvasElement, index: number, time: number): void {
+function labFramesFromRtmpose(frames: WebPoseFrame[]): LabPoseFrame[] {
+  return frames.map((frame) => ({
+    time: frame.time,
+    sticker: frame.landmarks ? { topology: 'coco' as Topology, landmarks: frame.landmarks } : null,
+    tracked: frame.landmarks ? trackedFromCoco2d(frame.landmarks) : null,
+  }))
+}
+
+function labFramesFromAgformer(frames: WebPoseFrame[]): LabPoseFrame[] {
+  return frames.map((frame) => {
+    if (!frame.landmarks) return { time: frame.time, sticker: null, tracked: null }
+    return {
+      time: frame.time,
+      sticker: { topology: 'h36m' as Topology, landmarks: projectH36mToSticker(frame.landmarks) },
+      tracked: trackedFromH36m3d(frame.landmarks),
+    }
+  })
+}
+
+function labFramesFromHybrid(cocoFrames: WebPoseFrame[], h36mFrames: WebPoseFrame[]): LabPoseFrame[] {
+  return cocoFrames.map((frame, index) => {
+    const h36m = h36mFrames[index]?.landmarks
+    if (!frame.landmarks || !h36m) return { time: frame.time, sticker: null, tracked: null }
+    return {
+      time: frame.time,
+      sticker: { topology: 'coco' as Topology, landmarks: frame.landmarks },
+      tracked: trackedFromHybrid(frame.landmarks, h36m),
+    }
+  })
+}
+
+async function processComparison(): Promise<void> {
+  if (!sourceBlob) return
+  processButton.disabled = true
+  comparisonReady = false
+  runStatus.textContent = 'processando candidatos'
+  updateProcessingStatus({ status: 'processing', stage: 'mediapipe', progress: 0, detail: 'Amostrando MediaPipe no mesmo clock do WebGPU' })
+  try {
+    const mediaPipeFrames = await sampleMediaPipe(sourceVideo, (detail, progress) => {
+      updateProcessingStatus({ status: 'processing', stage: 'mediapipe', progress: Math.round(progress * 0.22), detail })
+    })
+
+    const webGpu = await processWithWebGpu(sourceVideo, (detail, progress) => {
+      const lower = detail.toLowerCase()
+      const stage = lower.includes('crop')
+        ? 'crop_hybrid'
+        : lower.includes('agformer')
+          ? 'agformer_pure'
+          : 'rtmpose'
+      updateProcessingStatus({
+        status: 'processing',
+        stage,
+        progress: 22 + Math.round(progress * 0.76),
+        detail,
+      })
+    })
+
+    const hybrid = labFramesFromHybrid(webGpu.rtmpose, webGpu.motionagformer)
+    labFrames = {
+      mediapipe: mediaPipeFrames,
+      rtmpose: labFramesFromRtmpose(webGpu.rtmpose),
+      agformer_pure: labFramesFromAgformer(webGpu.motionagformer),
+      hybrid,
+      hybrid_smooth: smoothLabFrames(hybrid),
+      crop_hybrid: labFramesFromHybrid(webGpu.rtmposeCrop, webGpu.agformerCrop),
+    }
+    comparisonReady = true
+
+    document.querySelectorAll<HTMLElement>('.model-card').forEach((card, index) => {
+      const frames = labFrames[modelDefinitions[index].pipeline]
+      const trackedCount = frames?.filter((frame) => frame.tracked).length ?? 0
+      const state = card.querySelector<HTMLElement>('.model-state')
+      const frameRate = card.querySelector<HTMLElement>('.frame-rate')
+      if (state) state.textContent = trackedCount ? `${trackedCount} poses ok` : 'sem pose util'
+      if (frameRate) frameRate.textContent = `${SAMPLE_FPS} FPS`
+      card.classList.remove('is-processing')
+    })
+
+    updateProcessingStatus({
+      status: 'complete',
+      stage: 'complete',
+      progress: 100,
+      detail: 'Comparacao pronta — hybrid / filtro / crop lado a lado com o mesmo IK',
+    })
+    runStatus.textContent = 'comparacao pronta'
+    renderPoses()
+  } catch (error) {
+    console.error('Unable to process comparison', error)
+    runStatus.textContent = 'falha no processamento'
+    processingDetail.textContent = error instanceof Error ? error.message : 'Falha desconhecida durante o processamento.'
+  } finally {
+    processButton.disabled = false
+  }
+}
+
+async function checkBackend(): Promise<void> {
+  const webGpuAvailable = 'gpu' in navigator && Boolean(await navigator.gpu?.requestAdapter())
+  pipelineNote.textContent = webGpuAvailable
+    ? 'WebGPU ativo. Candidatos: MediaPipe, RTMPose, AGFormer, Hybrid, Filtro, Crop.'
+    : 'WebGPU indisponivel: RTMPose/AGFormer usam fallback WASM.'
+}
+
+function drawSticker(canvas: HTMLCanvasElement, index: number): void {
   const bounds = canvas.getBoundingClientRect()
   const width = Math.max(1, Math.round(bounds.width * devicePixelRatio))
   const height = Math.max(1, Math.round(bounds.height * devicePixelRatio))
@@ -419,100 +516,69 @@ function drawPlaceholder(canvas: HTMLCanvasElement, index: number, time: number)
   const context = canvas.getContext('2d')!
   context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0)
   context.clearRect(0, 0, bounds.width, bounds.height)
-  const accent = modelDefinitions[index].color
-  const centerX = bounds.width / 2
-  const centerY = bounds.height * 0.56
-  const pace = time * (2.8 + index * 0.07)
-  const sway = Math.sin(pace + index) * 10
-  const punch = Math.max(0, Math.sin(pace * 0.67 + index * 0.8)) * (18 + index * 3)
 
+  const accent = modelDefinitions[index].color
   context.strokeStyle = accent
   context.fillStyle = accent
   context.lineCap = 'round'
   context.lineJoin = 'round'
-  context.lineWidth = view === 'skeleton' ? 3 : 5
+  context.lineWidth = 3
   context.shadowColor = `${accent}55`
-  context.shadowBlur = 16
+  context.shadowBlur = 14
 
-  const headY = centerY - 69
-  const shoulderY = centerY - 45
-  const hipY = centerY + 20
-  const leftShoulderX = centerX - 25 + sway * 0.2
-  const rightShoulderX = centerX + 25 + sway * 0.2
-  const leftElbowX = centerX - 47 - punch * 0.35
-  const rightElbowX = centerX + 42 + punch
-  const wristY = centerY - 12 + Math.cos(pace) * 8
-
-  const landmarks = landmarksFor(index)
-  if (landmarks) {
-    const point = (landmarkIndex: number): [number, number] | undefined => {
-      const landmark = landmarks[landmarkIndex]
-      if (!landmark || (landmark.visibility ?? 1) < 0.35) return undefined
-      const isTemporal = index >= 2
-      const x = isTemporal ? .5 + landmark.x * .3 : landmark.x
-      const y = isTemporal ? .58 - landmark.y * .3 : landmark.y
-      return [x * bounds.width, y * bounds.height]
-    }
-    const connections: ReadonlyArray<readonly [number, number]> = index === 0
-      ? [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 25], [25, 27], [24, 26], [26, 28]]
-      : [[5, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16]]
-    context.strokeStyle = accent
-    for (const [fromIndex, toIndex] of connections) {
-      const from = point(fromIndex)
-      const to = point(toIndex)
-      if (!from || !to) continue
-      context.beginPath()
-      context.moveTo(...from)
-      context.lineTo(...to)
-      context.stroke()
-    }
-    context.fillStyle = accent
-    for (const landmarkIndex of new Set(connections.flat())) {
-      const landmark = point(landmarkIndex)
-      if (!landmark) continue
-      context.beginPath()
-      context.arc(...landmark, view === 'avatar' ? 5 : 3, 0, Math.PI * 2)
-      context.fill()
-    }
+  if (!comparisonReady) {
+    context.globalAlpha = 0.55
+    context.font = '11px ui-monospace, monospace'
+    context.textAlign = 'center'
+    context.fillText('PROCESSE O VIDEO', bounds.width / 2, bounds.height / 2)
     context.shadowBlur = 0
+    context.globalAlpha = 1
     return
   }
 
-  if (view === 'avatar') {
-    context.globalAlpha = 0.18
-    context.beginPath()
-    context.ellipse(centerX + sway * 0.2, centerY - 10, 37, 72, 0, 0, Math.PI * 2)
-    context.fill()
+  const frame = frameFor(index)
+  const sticker = frame?.sticker
+  if (!sticker) {
+    context.globalAlpha = 0.45
+    context.font = '11px ui-monospace, monospace'
+    context.textAlign = 'center'
+    context.fillText('SEM DETECCAO', bounds.width / 2, bounds.height / 2)
+    context.shadowBlur = 0
     context.globalAlpha = 1
+    return
   }
-  const lines = [
-    [centerX, headY + 15, centerX + sway * 0.2, shoulderY],
-    [leftShoulderX, shoulderY, leftElbowX, centerY - 25],
-    [leftElbowX, centerY - 25, leftElbowX - 8, wristY],
-    [rightShoulderX, shoulderY, rightElbowX, centerY - 25],
-    [rightElbowX, centerY - 25, rightElbowX + 6, wristY - 7],
-    [leftShoulderX, shoulderY, centerX + sway * 0.2, hipY],
-    [rightShoulderX, shoulderY, centerX + sway * 0.2, hipY],
-    [centerX + sway * 0.2, hipY, centerX - 25 - sway * 0.3, centerY + 70],
-    [centerX + sway * 0.2, hipY, centerX + 25 - sway * 0.3, centerY + 70],
-  ]
-  for (const [fromX, fromY, toX, toY] of lines) {
+
+  const point = (landmarkIndex: number): [number, number] | undefined => {
+    const landmark = sticker.landmarks[landmarkIndex]
+    if (!landmark || (landmark.visibility ?? 1) < 0.12) return undefined
+    if (!Number.isFinite(landmark.x) || !Number.isFinite(landmark.y)) return undefined
+    if (landmark.x < -0.25 || landmark.x > 1.25 || landmark.y < -0.25 || landmark.y > 1.25) return undefined
+    return [landmark.x * bounds.width, landmark.y * bounds.height]
+  }
+
+  const connections = connectionsFor(sticker.topology)
+  for (const [fromIndex, toIndex] of connections) {
+    const from = point(fromIndex)
+    const to = point(toIndex)
+    if (!from || !to) continue
     context.beginPath()
-    context.moveTo(fromX, fromY)
-    context.lineTo(toX, toY)
+    context.moveTo(...from)
+    context.lineTo(...to)
     context.stroke()
   }
-  context.beginPath()
-  context.arc(centerX, headY, 15, 0, Math.PI * 2)
-  view === 'avatar' ? context.fill() : context.stroke()
+  for (const landmarkIndex of new Set(connections.flat())) {
+    const landmark = point(landmarkIndex)
+    if (!landmark) continue
+    context.beginPath()
+    context.arc(...landmark, 3.2, 0, Math.PI * 2)
+    context.fill()
+  }
   context.shadowBlur = 0
 }
 
 function renderPoses(): void {
-  const time = sourceVideo.currentTime || 0
-  detectMediaPipePose()
-  canvasElements.forEach((canvas, index) => drawPlaceholder(canvas, index, time))
-  if (view === 'avatar') renderAvatars(time)
+  canvasElements.forEach((canvas, index) => drawSticker(canvas, index))
+  if (view === 'avatar') renderAvatars()
   if (!sourceVideo.paused && !sourceVideo.ended) requestAnimationFrame(renderPoses)
 }
 
@@ -522,20 +588,16 @@ videoInput.addEventListener('change', () => {
   loadVideoSource(URL.createObjectURL(file), file.name, file)
   runStatus.textContent = 'carregando MediaPipe'
   void loadMediaPipe().then(() => {
-    runStatus.textContent = 'video carregado'
-    const mediaPipeState = document.querySelector<HTMLElement>('.model-card:first-child .model-state')
-    if (mediaPipeState) mediaPipeState.textContent = 'rastreador local pronto'
+    runStatus.textContent = 'video carregado — processe a comparacao'
   }).catch((error: unknown) => {
     console.error('Unable to load MediaPipe pose landmarker', error)
     runStatus.textContent = 'MediaPipe indisponivel'
-    const mediaPipeState = document.querySelector<HTMLElement>('.model-card:first-child .model-state')
-    if (mediaPipeState) mediaPipeState.textContent = 'falha ao carregar modelo'
   })
 })
 
 recordButton.addEventListener('click', () => { void startRecording() })
 stopRecordingButton.addEventListener('click', () => recorder?.state === 'recording' && recorder.stop())
-processButton.addEventListener('click', () => { void processWithWebGpuOnly() })
+processButton.addEventListener('click', () => { void processComparison() })
 
 sourceVideo.addEventListener('loadedmetadata', () => {
   timeline.max = String(sourceVideo.duration)
@@ -550,14 +612,14 @@ sourceVideo.addEventListener('loadedmetadata', () => {
 sourceVideo.addEventListener('timeupdate', updateTimeline)
 sourceVideo.addEventListener('play', () => {
   playButton.textContent = '❚❚'
-  runStatus.textContent = 'reproduzindo comparacao'
+  runStatus.textContent = comparisonReady ? 'reproduzindo comparacao' : 'reproduzindo video'
   renderPoses()
 })
 sourceVideo.addEventListener('pause', () => {
   playButton.textContent = '▶'
-  if (!sourceVideo.ended) runStatus.textContent = 'comparacao pausada'
+  if (!sourceVideo.ended) runStatus.textContent = comparisonReady ? 'comparacao pausada' : 'video pausado'
 })
-sourceVideo.addEventListener('ended', () => { runStatus.textContent = 'comparacao concluida' })
+sourceVideo.addEventListener('ended', () => { runStatus.textContent = 'reproducao concluida' })
 
 playButton.addEventListener('click', () => {
   if (sourceVideo.paused) void sourceVideo.play()
