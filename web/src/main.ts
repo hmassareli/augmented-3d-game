@@ -11,6 +11,7 @@ app.innerHTML = `
     <header class="hud top-hud">
       <p class="eyebrow">ROUND 01 <span>•</span> PROTOTYPE</p>
       <h1>COUNTERPUNCH</h1>
+      <a class="lab-link" href="/compare.html">ABRIR LABORATORIO DE POSE</a>
     </header>
     <section class="hud fighter-status player-status" aria-label="Status do jogador">
       <div><span>PLAYER</span><strong id="player-stamina">100</strong></div>

@@ -1,0 +1,5 @@
+# Installed without dependency resolution by run-pose-backend.cmd.
+# The base requirements pin NumPy and OpenCV to the ABI used by MediaPipe/OpenMMLab.
+onnxruntime-directml==1.24.4
+rtmlib==0.0.15
+onnx==1.22.0

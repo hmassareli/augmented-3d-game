@@ -17,6 +17,8 @@ body { margin: 0; min-width: 320px; }
 .eyebrow { color: #d7bd85; font-family: ui-monospace, monospace; font-size: 11px; letter-spacing: 2px; margin: 0; white-space: nowrap; }
 .eyebrow span { color: #a83835; padding: 0 5px; }
 h1 { font-size: 25px; letter-spacing: 4px; line-height: 1; margin: 9px 0 0; }
+.lab-link { color: #d7bd85; display: inline-block; font-family: ui-monospace, monospace; font-size: 9px; letter-spacing: .8px; margin-top: 10px; pointer-events: auto; text-decoration: none; }
+.lab-link:hover { color: #f7f1e8; }
 
 .fighter-status { bottom: 29px; font-family: ui-monospace, monospace; font-size: 11px; letter-spacing: 1px; width: min(260px, calc(50vw - 34px)); }
 .player-status { left: 28px; }

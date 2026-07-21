@@ -1,0 +1,21 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+--find-links https://download.openmmlab.com/mmcv/dist/cpu/torch2.1/index.html
+
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+python-multipart>=0.0.20
+numpy==1.26.4
+opencv-python==4.9.0.80
+mediapipe==0.10.35
+setuptools<81
+torch==2.1.2+cpu
+torchvision==0.16.2+cpu
+mmengine==0.10.7
+mmcv==2.1.0
+mmpose==1.1.0
+mmdet==3.3.0
+munkres==1.1.4
+yapf==0.43.0
+easydict
+PyYAML
+yacs==0.1.8
