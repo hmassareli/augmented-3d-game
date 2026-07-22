@@ -31,7 +31,12 @@ export const H36M_CONNECTIONS: ReadonlyArray<readonly [number, number]> = [
   [8, 11], [11, 12], [12, 13], [8, 14], [14, 15], [15, 16],
 ]
 
-/** MediaPipe world-ish: +X person right, +Y up, +Z toward camera, ~meters. */
+/**
+ * MediaPipe world-ish contract (~meters, shoulder width ≈ 0.35), matched to Mixamo IK:
+ * +X image-right (person's left when facing camera — same as BlazePose world in this lab),
+ * Y increasing toward image-down relative lift (wrists below shoulders on screen → positive lift),
+ * −Z toward camera / in front, +Z behind.
+ */
 const TARGET_SHOULDER_WIDTH = 0.35
 
 function visibilityOk(point: StickerLandmark | undefined, min = 0.25): point is StickerLandmark {
@@ -117,7 +122,8 @@ export function trackedFromBlazePoseWorld(
 
 /**
  * Mild depth from foreshortening. Only when the segment is clearly compressed in-plane.
- * Image coords in, returns depth in the same units as `expectedLength`.
+ * Image coords in; returns signed depth in the same units as `expectedLength`.
+ * Negative = toward camera (in front), matching MediaPipe world Z.
  */
 function mildDepth(
   from: { x: number; y: number },
@@ -127,13 +133,16 @@ function mildDepth(
   const planar = Math.hypot(to.x - from.x, to.y - from.y)
   if (expectedLength < 1e-5 || planar / expectedLength > 0.88) return 0
   const depth = Math.sqrt(Math.max(0, expectedLength * expectedLength - planar * planar))
-  return Math.min(depth, expectedLength * 0.45)
+  // Prefer "in front of torso" when foreshortened — never invent behind-body depth.
+  return -Math.min(depth, expectedLength * 0.45)
 }
 
 /**
  * COCO-17 image landmarks → MediaPipe-like world → TrackedPose.
- * Image: +x right, +y down. MediaPipe world: +X person right, +Y up, +Z toward camera.
- * Person facing the camera ⇒ person's right is on the left of the image ⇒ negate image x.
+ * Image: +x right, +y down.
+ * Empirically MediaPipe world landmarks (lab audit) align with image axes for the Mixamo IK:
+ * +X image-right (person's left when facing camera), +Y image-down-ish relative lift.
+ * Do NOT use (0.5 − uv) — that mirrored X and inverted wrist lift vs MediaPipe, sending arms up.
  */
 export function trackedFromCoco2d(points: readonly StickerLandmark[]): TrackedPose | null {
   if (!visibilityOk(points[5], 0.12) || !visibilityOk(points[6], 0.12)) return null
@@ -145,8 +154,8 @@ export function trackedFromCoco2d(points: readonly StickerLandmark[]): TrackedPo
 
   const metric = TARGET_SHOULDER_WIDTH / shoulderSpan
   const imageToWorld = (point: StickerLandmark, zImageUnits: number): PosePoint => ({
-    x: (0.5 - point.x) * metric,
-    y: (0.5 - point.y) * metric,
+    x: (point.x - 0.5) * metric,
+    y: (point.y - 0.5) * metric,
     z: zImageUnits * metric,
   })
 
@@ -182,7 +191,8 @@ export function trackedFromCoco2d(points: readonly StickerLandmark[]): TrackedPo
 
 /**
  * H36M-17 root-relative 3D → MediaPipe-like world → TrackedPose.
- * MAG/MB: Y down (head more negative), X already person-right-positive-ish, Z camera depth.
+ * MAG/MB is Y-down. Lab audit: keep Y-down (do not negate) so wrist lift matches MediaPipe
+ * and Mixamo IK; X/Z already share MediaPipe's sign.
  */
 export function trackedFromH36m3d(points: readonly StickerLandmark[]): TrackedPose | null {
   const leftShoulder = points[11]
@@ -197,11 +207,10 @@ export function trackedFromH36m3d(points: readonly StickerLandmark[]): TrackedPo
     return null
   }
 
-  // Match MediaPipe: +X person right, +Y up, +Z toward camera.
   const toWorld = (point: StickerLandmark): PosePoint => ({
     x: point.x,
-    y: -(point.y ?? 0),
-    z: -(point.z ?? 0),
+    y: point.y ?? 0,
+    z: point.z ?? 0,
   })
 
   const leftS = toWorld(leftShoulder)
@@ -250,10 +259,11 @@ export function trackedFromHybrid(
     ? coco[12]
     : { x: rightShoulder2d.x, y: Math.min(0.98, rightShoulder2d.y + shoulderSpan * 1.35), visibility: 0.4 }
 
+  // Z only from H36M — keep native signs (same as trackedFromH36m3d).
   const toH = (point: StickerLandmark): PosePoint => ({
     x: point.x,
-    y: -(point.y ?? 0),
-    z: -(point.z ?? 0),
+    y: point.y ?? 0,
+    z: point.z ?? 0,
   })
   const hLeftShoulder = toH(h36m[11])
   const hRightShoulder = toH(h36m[14])
@@ -263,9 +273,10 @@ export function trackedFromHybrid(
   const shoulderMidZ = (hLeftShoulder.z + hRightShoulder.z) / 2
   const depthAt = (point: StickerLandmark): number => (toH(point).z - shoulderMidZ) * zScale
 
+  // Same image→world axes as trackedFromCoco2d (match MediaPipe / Mixamo IK).
   const xy = (point: StickerLandmark, z: number): PosePoint => ({
-    x: (0.5 - point.x) * metric,
-    y: (0.5 - point.y) * metric,
+    x: (point.x - 0.5) * metric,
+    y: (point.y - 0.5) * metric,
     z,
   })
 
@@ -291,7 +302,8 @@ export function enforceBoneLengths(pose: TrackedPose): TrackedPose {
     const dy = to.y - from.y
     const dz = to.z - from.z
     const current = Math.hypot(dx, dy, dz)
-    if (current < 1e-5) return { x: from.x, y: from.y, z: from.z + length }
+    // Degenerate → place slightly in front (−Z), not behind the torso.
+    if (current < 1e-5) return { x: from.x, y: from.y, z: from.z - length }
     const scale = length / current
     return { x: from.x + dx * scale, y: from.y + dy * scale, z: from.z + dz * scale }
   }

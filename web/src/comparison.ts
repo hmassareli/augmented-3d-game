@@ -21,6 +21,7 @@ import {
   applyUpperBodyPose,
   prepareAvatarRig,
   type AvatarRig,
+  type TrackedPose,
 } from './pose-retarget'
 import { getSampleTimes, processWithWebGpu, SAMPLE_FPS, seekVideo, type WebPoseFrame } from './webgpu-pose'
 
@@ -504,6 +505,245 @@ function labFramesFromHybrid(cocoFrames: WebPoseFrame[], h36mFrames: WebPoseFram
   })
 }
 
+/** Wrist Z relative to shoulder midplane. Negative = in front (toward camera), matching MediaPipe. */
+function wristDepth(pose: TrackedPose): { left: number; right: number; mean: number } {
+  const shoulderZ = (pose.leftShoulder.z + pose.rightShoulder.z) / 2
+  const left = pose.leftWrist.z - shoulderZ
+  const right = pose.rightWrist.z - shoulderZ
+  return { left, right, mean: (left + right) / 2 }
+}
+
+/** Wrist Y relative to shoulder midplane. Positive = above shoulders (MediaPipe +Y up). */
+function wristLift(pose: TrackedPose): number {
+  const shoulderY = (pose.leftShoulder.y + pose.rightShoulder.y) / 2
+  return ((pose.leftWrist.y + pose.rightWrist.y) / 2) - shoulderY
+}
+
+type DepthDiag = {
+  pipeline: PipelineKey
+  frames: number
+  /** Candidate wrist in back (+Z) while MediaPipe has wrists in front (−Z). */
+  frontBackFlips: number
+  /** Mean |Δ wrist-depth| vs MediaPipe (meters). */
+  meanAbsDepthDelta: number
+  /** Mean wrist lift delta vs MediaPipe (meters); large positive = hands too high. */
+  meanLiftDelta: number
+  sampleConflicts: Array<{ time: number; mpDepth: number; candDepth: number; liftDelta: number }>
+}
+
+function diagnoseDepthVsMediaPipe(
+  mediaPipe: LabPoseFrame[],
+  candidate: LabPoseFrame[],
+  pipeline: PipelineKey,
+): DepthDiag {
+  let frames = 0
+  let frontBackFlips = 0
+  let absDepthSum = 0
+  let liftDeltaSum = 0
+  const sampleConflicts: DepthDiag['sampleConflicts'] = []
+
+  const count = Math.min(mediaPipe.length, candidate.length)
+  for (let index = 0; index < count; index += 1) {
+    const mp = mediaPipe[index]?.tracked
+    const cand = candidate[index]?.tracked
+    if (!mp || !cand) continue
+    frames += 1
+    const mpDepth = wristDepth(mp).mean
+    const candDepth = wristDepth(cand).mean
+    const liftDelta = wristLift(cand) - wristLift(mp)
+    absDepthSum += Math.abs(candDepth - mpDepth)
+    liftDeltaSum += liftDelta
+    // MediaPipe clearly in front, candidate clearly behind (sign disagreement with margin).
+    if (mpDepth < -0.02 && candDepth > 0.02) {
+      frontBackFlips += 1
+      if (sampleConflicts.length < 5) {
+        sampleConflicts.push({
+          time: mediaPipe[index].time,
+          mpDepth,
+          candDepth,
+          liftDelta,
+        })
+      }
+    }
+  }
+
+  return {
+    pipeline,
+    frames,
+    frontBackFlips,
+    meanAbsDepthDelta: frames ? absDepthSum / frames : 0,
+    meanLiftDelta: frames ? liftDeltaSum / frames : 0,
+    sampleConflicts,
+  }
+}
+
+function logDepthDiagnostics(mediaPipe: LabPoseFrame[]): void {
+  const keys = modelDefinitions.map((model) => model.pipeline).filter((key) => key !== 'mediapipe')
+  const reports = keys
+    .map((key) => {
+      const frames = labFrames[key]
+      return frames ? diagnoseDepthVsMediaPipe(mediaPipe, frames, key) : null
+    })
+    .filter((report): report is DepthDiag => Boolean(report))
+
+  console.group('[lab] depth vs MediaPipe (−Z = frente / +Z = costas)')
+  for (const report of reports) {
+    const flipPct = report.frames ? Math.round((report.frontBackFlips / report.frames) * 100) : 0
+    console.log(
+      `${report.pipeline}: flips frente→costas ${report.frontBackFlips}/${report.frames} (${flipPct}%)`,
+      `|ΔZ|≈${report.meanAbsDepthDelta.toFixed(3)}m`,
+      `liftΔ≈${report.meanLiftDelta.toFixed(3)}m`,
+      report.sampleConflicts,
+    )
+  }
+  console.groupEnd()
+
+  const worst = [...reports].sort((a, b) => b.frontBackFlips - a.frontBackFlips)[0]
+  if (worst && worst.frontBackFlips > 0) {
+    const flipPct = Math.round((worst.frontBackFlips / Math.max(1, worst.frames)) * 100)
+    pipelineNote.textContent =
+      `Debug Z: ${worst.pipeline} inverte frente/costas em ${flipPct}% dos frames` +
+      (worst.meanLiftDelta > 0.05 ? ` · mãos +${worst.meanLiftDelta.toFixed(2)}m vs MP` : '')
+  } else if (reports.length) {
+    const lift = [...reports].sort((a, b) => Math.abs(b.meanLiftDelta) - Math.abs(a.meanLiftDelta))[0]
+    pipelineNote.textContent = lift && Math.abs(lift.meanLiftDelta) > 0.04
+      ? `Debug Z ok (sem flip). Lift suspeito: ${lift.pipeline} ΔY≈${lift.meanLiftDelta.toFixed(2)}m`
+      : 'Debug Z: sem flip frente/costas vs MediaPipe'
+  }
+}
+
+type JointSnapshot = {
+  leftShoulder: { x: number; y: number; z: number }
+  rightShoulder: { x: number; y: number; z: number }
+  leftElbow: { x: number; y: number; z: number }
+  rightElbow: { x: number; y: number; z: number }
+  leftWrist: { x: number; y: number; z: number }
+  rightWrist: { x: number; y: number; z: number }
+  wristDepth: number
+  wristLift: number
+  elbowDepth: number
+  /** Same axes the Mixamo IK consumes (poseToAvatarSpace). */
+  avatarLeftWrist: { x: number; y: number; z: number }
+  avatarRightWrist: { x: number; y: number; z: number }
+  avatarLeftElbow: { x: number; y: number; z: number }
+  avatarRightElbow: { x: number; y: number; z: number }
+}
+
+function toAvatarSpace(
+  point: { x: number; y: number; z: number },
+  shoulderCenter: { x: number; y: number; z: number },
+  shoulderWidth: number,
+): { x: number; y: number; z: number } {
+  return {
+    x: Number(((point.x - shoulderCenter.x) / shoulderWidth).toFixed(4)),
+    y: Number(((shoulderCenter.y - point.y) / shoulderWidth).toFixed(4)),
+    z: Number(((shoulderCenter.z - point.z) / shoulderWidth).toFixed(4)),
+  }
+}
+
+function snapshotPose(pose: TrackedPose): JointSnapshot {
+  const shoulderCenter = {
+    x: (pose.leftShoulder.x + pose.rightShoulder.x) / 2,
+    y: (pose.leftShoulder.y + pose.rightShoulder.y) / 2,
+    z: (pose.leftShoulder.z + pose.rightShoulder.z) / 2,
+  }
+  const round = (point: { x: number; y: number; z: number }) => ({
+    x: Number(point.x.toFixed(4)),
+    y: Number(point.y.toFixed(4)),
+    z: Number(point.z.toFixed(4)),
+  })
+  return {
+    leftShoulder: round(pose.leftShoulder),
+    rightShoulder: round(pose.rightShoulder),
+    leftElbow: round(pose.leftElbow),
+    rightElbow: round(pose.rightElbow),
+    leftWrist: round(pose.leftWrist),
+    rightWrist: round(pose.rightWrist),
+    wristDepth: Number((((pose.leftWrist.z + pose.rightWrist.z) / 2) - shoulderCenter.z).toFixed(4)),
+    wristLift: Number((((pose.leftWrist.y + pose.rightWrist.y) / 2) - shoulderCenter.y).toFixed(4)),
+    elbowDepth: Number((((pose.leftElbow.z + pose.rightElbow.z) / 2) - shoulderCenter.z).toFixed(4)),
+    avatarLeftWrist: toAvatarSpace(pose.leftWrist, shoulderCenter, pose.shoulderWidth),
+    avatarRightWrist: toAvatarSpace(pose.rightWrist, shoulderCenter, pose.shoulderWidth),
+    avatarLeftElbow: toAvatarSpace(pose.leftElbow, shoulderCenter, pose.shoulderWidth),
+    avatarRightElbow: toAvatarSpace(pose.rightElbow, shoulderCenter, pose.shoulderWidth),
+  }
+}
+
+/** Full audit payload for Playwright / console — compare TrackedPose joints vs MediaPipe. */
+function buildLabAudit() {
+  const mediaPipe = labFrames.mediapipe ?? []
+  const sampleIndexes = mediaPipe.length
+    ? [0, Math.floor(mediaPipe.length * 0.25), Math.floor(mediaPipe.length * 0.5), Math.floor(mediaPipe.length * 0.75), mediaPipe.length - 1]
+      .filter((value, index, all) => all.indexOf(value) === index)
+    : []
+
+  const pipelines = modelDefinitions.map((model) => model.pipeline)
+  const summaries = pipelines.map((pipeline) => {
+    const frames = labFrames[pipeline] ?? []
+    const vsMp = pipeline === 'mediapipe' || !mediaPipe.length
+      ? null
+      : diagnoseDepthVsMediaPipe(mediaPipe, frames, pipeline)
+    let meanWristDepth = 0
+    let meanWristLift = 0
+    let tracked = 0
+    let handsFront = 0
+    let handsBack = 0
+    let handsHigh = 0
+    for (const frame of frames) {
+      if (!frame.tracked) continue
+      tracked += 1
+      const depth = wristDepth(frame.tracked).mean
+      const lift = wristLift(frame.tracked)
+      meanWristDepth += depth
+      meanWristLift += lift
+      if (depth < -0.02) handsFront += 1
+      if (depth > 0.02) handsBack += 1
+      if (lift > -0.05) handsHigh += 1 // near/above shoulders (fists at chest should be clearly below)
+    }
+    return {
+      pipeline,
+      tracked,
+      meanWristDepth: tracked ? meanWristDepth / tracked : null,
+      meanWristLift: tracked ? meanWristLift / tracked : null,
+      handsFront,
+      handsBack,
+      handsHigh,
+      vsMediaPipe: vsMp,
+    }
+  })
+
+  const samples = sampleIndexes.map((index) => {
+    const time = mediaPipe[index]?.time ?? labFrames.rtmpose?.[index]?.time ?? index / SAMPLE_FPS
+    const byPipeline: Record<string, JointSnapshot | null> = {}
+    for (const pipeline of pipelines) {
+      const pose = labFrames[pipeline]?.[index]?.tracked ?? null
+      byPipeline[pipeline] = pose ? snapshotPose(pose) : null
+    }
+    return { index, time, byPipeline }
+  })
+
+  return {
+    ready: comparisonReady,
+    frameCount: mediaPipe.length,
+    sampleFps: SAMPLE_FPS,
+    convention: 'TrackedPose meters: +Y up, −Z toward camera / in front, +Z behind',
+    summaries,
+    samples,
+  }
+}
+
+declare global {
+  interface Window {
+    __labAudit?: () => ReturnType<typeof buildLabAudit>
+    __labFrames?: typeof labFrames
+  }
+}
+window.__labAudit = buildLabAudit
+Object.defineProperty(window, '__labFrames', {
+  configurable: true,
+  get: () => labFrames,
+})
+
 async function processComparison(): Promise<void> {
   if (!sourceBlob) return
   processButton.disabled = true
@@ -540,13 +780,28 @@ async function processComparison(): Promise<void> {
       crop_hybrid: labFramesFromHybrid(webGpu.rtmposeCrop, webGpu.agformerCrop),
     }
     comparisonReady = true
+    logDepthDiagnostics(mediaPipeFrames)
+    console.log('[lab] audit', buildLabAudit())
 
     document.querySelectorAll<HTMLElement>('.model-card').forEach((card, index) => {
-      const frames = labFrames[modelDefinitions[index].pipeline]
+      const pipeline = modelDefinitions[index].pipeline
+      const frames = labFrames[pipeline]
       const trackedCount = frames?.filter((frame) => frame.tracked).length ?? 0
       const state = card.querySelector<HTMLElement>('.model-state')
       const frameRate = card.querySelector<HTMLElement>('.frame-rate')
-      if (state) state.textContent = trackedCount ? `${trackedCount} poses ok` : 'sem pose util'
+      if (pipeline !== 'mediapipe' && frames) {
+        const diag = diagnoseDepthVsMediaPipe(mediaPipeFrames, frames, pipeline)
+        const flipPct = diag.frames ? Math.round((diag.frontBackFlips / diag.frames) * 100) : 0
+        if (state) {
+          state.textContent = diag.frontBackFlips
+            ? `${trackedCount} ok · Z flip ${flipPct}%`
+            : trackedCount
+              ? `${trackedCount} poses ok`
+              : 'sem pose util'
+        }
+      } else if (state) {
+        state.textContent = trackedCount ? `${trackedCount} poses ok` : 'sem pose util'
+      }
       if (frameRate) frameRate.textContent = `${SAMPLE_FPS} FPS`
       card.classList.remove('is-processing')
     })
@@ -555,7 +810,7 @@ async function processComparison(): Promise<void> {
       status: 'complete',
       stage: 'complete',
       progress: 100,
-      detail: 'Comparacao pronta — hybrid / filtro / crop lado a lado com o mesmo IK',
+      detail: 'Comparacao pronta — abra o console para o log de profundidade vs MediaPipe',
     })
     runStatus.textContent = 'comparacao pronta'
     renderPoses()

@@ -17,11 +17,43 @@ const sessions: Partial<Record<keyof typeof MODEL_URLS, ort.InferenceSession>> =
 
 type PersonBox = { x0: number; y0: number; x1: number; y1: number }
 
+function configureOrtWasm(): void {
+  // Use the npm CDN so dynamic `import()` of ORT glue is not rewritten by Vite (`?import`).
+  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/'
+  ort.env.wasm.numThreads = 1
+}
+
 async function loadSession(name: keyof typeof MODEL_URLS): Promise<ort.InferenceSession> {
   const existing = sessions[name]
   if (existing) return existing
-  const executionProviders = 'gpu' in navigator ? ['webgpu', 'wasm'] : ['wasm']
-  const session = await ort.InferenceSession.create(MODEL_URLS[name], { executionProviders })
+  configureOrtWasm()
+  // Prefer WASM in automated/lab runs — WebGPU init is flaky under Playwright.
+  const preferWasm = new URLSearchParams(location.search).has('wasm')
+    || !(typeof navigator !== 'undefined' && 'gpu' in navigator)
+  const executionProviders = preferWasm ? ['wasm'] : ['webgpu', 'wasm']
+  const modelUrl = new URL(MODEL_URLS[name], location.origin).href
+  let lastError: unknown
+  let modelBuffer: ArrayBuffer | null = null
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(modelUrl, { cache: 'no-store' })
+      if (!response.ok) {
+        throw new Error(`Falha ao baixar ${name}: HTTP ${response.status} (${modelUrl})`)
+      }
+      modelBuffer = await response.arrayBuffer()
+      break
+    } catch (error) {
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)))
+    }
+  }
+  if (!modelBuffer) {
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
+  }
+  if (modelBuffer.byteLength < 1_000_000) {
+    throw new Error(`Modelo ${name} suspeito (${modelBuffer.byteLength} bytes) em ${modelUrl}`)
+  }
+  const session = await ort.InferenceSession.create(modelBuffer, { executionProviders })
   sessions[name] = session
   return session
 }
