@@ -63,13 +63,18 @@ export function cacheRetargetBones(
   ]);
   const boneNames = [
     "mixamorigHips",
-    "mixamorigSpine", "mixamorigSpine1", "mixamorigSpine2", "mixamorigNeck",
+    "mixamorigSpine",
+    "mixamorigSpine1",
+    "mixamorigSpine2",
+    "mixamorigNeck",
     "mixamorigLeftArm",
     "mixamorigLeftForeArm",
     "mixamorigRightArm",
     "mixamorigRightForeArm",
-    "mixamorigLeftUpLeg", "mixamorigLeftLeg",
-    "mixamorigRightUpLeg", "mixamorigRightLeg",
+    "mixamorigLeftUpLeg",
+    "mixamorigLeftLeg",
+    "mixamorigRightUpLeg",
+    "mixamorigRightLeg",
     ...handBoneNames,
   ];
   const rootWorldQuaternion = avatar.getWorldQuaternion(new THREE.Quaternion());
@@ -247,14 +252,21 @@ function solveArm(
   const foreArmLength = elbowWorld.distanceTo(wristWorld);
   const sourceUpperArm = elbow.clone().sub(shoulder);
   const sourceWrist = wrist.clone().sub(shoulder);
-  const oppositeUpperArmName = upperArmName.includes('Left')
-    ? 'mixamorigRightArm'
-    : 'mixamorigLeftArm';
+  const oppositeUpperArmName = upperArmName.includes("Left")
+    ? "mixamorigRightArm"
+    : "mixamorigLeftArm";
   const oppositeUpperArm = rig.bones.get(oppositeUpperArmName);
   const avatarShoulderWidth = oppositeUpperArm
-    ? shoulderWorld.distanceTo(oppositeUpperArm.bone.getWorldPosition(new THREE.Vector3()))
+    ? shoulderWorld.distanceTo(
+        oppositeUpperArm.bone.getWorldPosition(new THREE.Vector3()),
+      )
     : 0;
-  if (upperArmLength < 0.001 || foreArmLength < 0.001 || avatarShoulderWidth < 0.001 || sourceWrist.lengthSq() < 0.0001)
+  if (
+    upperArmLength < 0.001 ||
+    foreArmLength < 0.001 ||
+    avatarShoulderWidth < 0.001 ||
+    sourceWrist.lengthSq() < 0.0001
+  )
     return;
 
   const reach = upperArmLength + foreArmLength;
@@ -329,8 +341,8 @@ function solveLeg(
 ): void {
   const upperLeg = rig.bones.get(upperLegName);
   const lowerLeg = rig.bones.get(lowerLegName);
-  const leftArm = rig.bones.get('mixamorigLeftArm');
-  const rightArm = rig.bones.get('mixamorigRightArm');
+  const leftArm = rig.bones.get("mixamorigLeftArm");
+  const rightArm = rig.bones.get("mixamorigRightArm");
   if (!upperLeg || !lowerLeg || !leftArm || !rightArm) return;
 
   const hipWorld = upperLeg.bone.getWorldPosition(new THREE.Vector3());
@@ -340,9 +352,16 @@ function solveLeg(
   const lowerLegLength = kneeWorld.distanceTo(ankleWorld);
   const sourceUpperLeg = knee.clone().sub(hip);
   const sourceAnkle = ankle.clone().sub(hip);
-  const avatarShoulderWidth = leftArm.bone.getWorldPosition(new THREE.Vector3())
+  const avatarShoulderWidth = leftArm.bone
+    .getWorldPosition(new THREE.Vector3())
     .distanceTo(rightArm.bone.getWorldPosition(new THREE.Vector3()));
-  if (upperLegLength < 0.001 || lowerLegLength < 0.001 || avatarShoulderWidth < 0.001 || sourceAnkle.lengthSq() < 0.0001) return;
+  if (
+    upperLegLength < 0.001 ||
+    lowerLegLength < 0.001 ||
+    avatarShoulderWidth < 0.001 ||
+    sourceAnkle.lengthSq() < 0.0001
+  )
+    return;
 
   const reach = upperLegLength + lowerLegLength;
   const minimumReach = Math.abs(upperLegLength - lowerLegLength) + 0.001;
@@ -351,31 +370,55 @@ function solveLeg(
     minimumReach,
     reach - 0.001,
   );
-  const targetWorld = hipWorld.clone().addScaledVector(
-    sourceAnkle.normalize().applyQuaternion(rig.avatar.getWorldQuaternion(new THREE.Quaternion())),
-    targetDistance,
-  );
+  const targetWorld = hipWorld
+    .clone()
+    .addScaledVector(
+      sourceAnkle
+        .normalize()
+        .applyQuaternion(rig.avatar.getWorldQuaternion(new THREE.Quaternion())),
+      targetDistance,
+    );
   const hipToTarget = targetWorld.clone().sub(hipWorld);
   const hipToTargetLength = hipToTarget.length();
   if (hipToTargetLength < 0.001) return;
 
   const axis = hipToTarget.normalize();
-  const sourceKneeDirection = sourceUpperLeg.normalize().applyQuaternion(rig.avatar.getWorldQuaternion(new THREE.Quaternion()));
-  const kneePlane = sourceKneeDirection.addScaledVector(axis, -sourceKneeDirection.dot(axis));
-  if (kneePlane.lengthSq() < 0.0001) kneePlane.copy(new THREE.Vector3(0, 0, 1).cross(axis));
+  const sourceKneeDirection = sourceUpperLeg
+    .normalize()
+    .applyQuaternion(rig.avatar.getWorldQuaternion(new THREE.Quaternion()));
+  const kneePlane = sourceKneeDirection.addScaledVector(
+    axis,
+    -sourceKneeDirection.dot(axis),
+  );
+  if (kneePlane.lengthSq() < 0.0001)
+    kneePlane.copy(new THREE.Vector3(0, 0, 1).cross(axis));
   kneePlane.normalize();
-  const kneeAlongAxis = (upperLegLength ** 2 - lowerLegLength ** 2 + hipToTargetLength ** 2) / (2 * hipToTargetLength);
-  const kneeOffset = Math.sqrt(Math.max(0, upperLegLength ** 2 - kneeAlongAxis ** 2));
-  const solvedKneeWorld = hipWorld.clone()
+  const kneeAlongAxis =
+    (upperLegLength ** 2 - lowerLegLength ** 2 + hipToTargetLength ** 2) /
+    (2 * hipToTargetLength);
+  const kneeOffset = Math.sqrt(
+    Math.max(0, upperLegLength ** 2 - kneeAlongAxis ** 2),
+  );
+  const solvedKneeWorld = hipWorld
+    .clone()
     .addScaledVector(axis, kneeAlongAxis)
     .addScaledVector(kneePlane, kneeOffset);
-  const inverseRootQuaternion = rig.avatar.getWorldQuaternion(new THREE.Quaternion()).invert();
+  const inverseRootQuaternion = rig.avatar
+    .getWorldQuaternion(new THREE.Quaternion())
+    .invert();
 
-  rotateBoneToward(rig, upperLegName, solvedKneeWorld.sub(hipWorld).applyQuaternion(inverseRootQuaternion), 1);
+  rotateBoneToward(
+    rig,
+    upperLegName,
+    solvedKneeWorld.sub(hipWorld).applyQuaternion(inverseRootQuaternion),
+    1,
+  );
   rotateBoneToward(
     rig,
     lowerLegName,
-    targetWorld.sub(lowerLeg.bone.getWorldPosition(new THREE.Vector3())).applyQuaternion(inverseRootQuaternion),
+    targetWorld
+      .sub(lowerLeg.bone.getWorldPosition(new THREE.Vector3()))
+      .applyQuaternion(inverseRootQuaternion),
     1,
   );
 }
@@ -460,12 +503,36 @@ export function applyUpperBodyPose(rig: AvatarRig, pose: TrackedPose): void {
     shoulderCenter,
     shoulderWidth,
   );
-  const leftHipPoint = poseToAvatarSpace(leftHip, shoulderCenter, shoulderWidth);
-  const rightHipPoint = poseToAvatarSpace(rightHip, shoulderCenter, shoulderWidth);
-  const leftKneePoint = poseToAvatarSpace(leftKnee, shoulderCenter, shoulderWidth);
-  const rightKneePoint = poseToAvatarSpace(rightKnee, shoulderCenter, shoulderWidth);
-  const leftAnklePoint = poseToAvatarSpace(leftAnkle, shoulderCenter, shoulderWidth);
-  const rightAnklePoint = poseToAvatarSpace(rightAnkle, shoulderCenter, shoulderWidth);
+  const leftHipPoint = poseToAvatarSpace(
+    leftHip,
+    shoulderCenter,
+    shoulderWidth,
+  );
+  const rightHipPoint = poseToAvatarSpace(
+    rightHip,
+    shoulderCenter,
+    shoulderWidth,
+  );
+  const leftKneePoint = poseToAvatarSpace(
+    leftKnee,
+    shoulderCenter,
+    shoulderWidth,
+  );
+  const rightKneePoint = poseToAvatarSpace(
+    rightKnee,
+    shoulderCenter,
+    shoulderWidth,
+  );
+  const leftAnklePoint = poseToAvatarSpace(
+    leftAnkle,
+    shoulderCenter,
+    shoulderWidth,
+  );
+  const rightAnklePoint = poseToAvatarSpace(
+    rightAnkle,
+    shoulderCenter,
+    shoulderWidth,
+  );
 
   const torsoDirection = hipCenterPoint.clone().negate();
   torsoDirection.x *= 1.8;
@@ -489,8 +556,22 @@ export function applyUpperBodyPose(rig: AvatarRig, pose: TrackedPose): void {
     rightElbowPoint,
     rightWristPoint,
   );
-  solveLeg(rig, "mixamorigLeftUpLeg", "mixamorigLeftLeg", leftHipPoint, leftKneePoint, leftAnklePoint);
-  solveLeg(rig, "mixamorigRightUpLeg", "mixamorigRightLeg", rightHipPoint, rightKneePoint, rightAnklePoint);
+  solveLeg(
+    rig,
+    "mixamorigLeftUpLeg",
+    "mixamorigLeftLeg",
+    leftHipPoint,
+    leftKneePoint,
+    leftAnklePoint,
+  );
+  solveLeg(
+    rig,
+    "mixamorigRightUpLeg",
+    "mixamorigRightLeg",
+    rightHipPoint,
+    rightKneePoint,
+    rightAnklePoint,
+  );
 }
 
 export function applyGuardPose(rig: AvatarRig): void {
