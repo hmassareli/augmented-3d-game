@@ -22,7 +22,6 @@ app.innerHTML = `
     <header class="hud top-hud">
       <p class="eyebrow">ROUND 01 <span>•</span> PROTOTYPE</p>
       <h1>COUNTERPUNCH</h1>
-      <a class="lab-link" href="/compare.html">ABRIR LABORATORIO DE POSE</a>
     </header>
     <section class="hud fighter-status player-status" aria-label="Status do jogador">
       <div><span>PLAYER</span><strong id="player-stamina">100</strong></div>
@@ -476,6 +475,10 @@ function updateTrackedGloves(): void {
   const rightElbow = worldLandmarks[14]
   const leftHip = worldLandmarks[23]
   const rightHip = worldLandmarks[24]
+  const leftKnee = worldLandmarks[25]
+  const rightKnee = worldLandmarks[26]
+  const leftAnkle = worldLandmarks[27]
+  const rightAnkle = worldLandmarks[28]
   latestTrackedHands = assignHandsToSides(imageLandmarks)
   const torsoVisibility = Math.min(
     imageLandmarks[11].visibility ?? 0,
@@ -505,6 +508,10 @@ function updateTrackedGloves(): void {
     rightWrist: poseRightWrist,
     leftHip,
     rightHip,
+    leftKnee,
+    rightKnee,
+    leftAnkle,
+    rightAnkle,
     shoulderWidth,
   }
   setTrackingStatus(latestHandLandmarks.length ? 'corpo e maos ativos' : 'rastreamento corporal ativo', true)
